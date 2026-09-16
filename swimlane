@@ -1,5 +1,5 @@
 """
-excel_swimlane.py
+Swimlane_Flow.py
 
 Builds a swimlane process-flow diagram from an Excel workbook by tracing
 cross-sheet formula references (cell-level lineage -> sheet-level graph).
@@ -13,13 +13,13 @@ Pipeline:
     5. render_swimlane_html()      -> interactive HTML (vis-network via CDN)
 
 Usage (CLI):
-    python excel_swimlane.py workbook.xlsx --out swimlane.png
-    python excel_swimlane.py workbook.xlsx --out swimlane.html --html
-    python excel_swimlane.py workbook.xlsx --out swimlane.png \
+    python Swimlane_Flow.py workbook.xlsx --out swimlane.png
+    python Swimlane_Flow.py workbook.xlsx --out swimlane.html --html
+    python Swimlane_Flow.py workbook.xlsx --out swimlane.png \
         --lanes "Input:RawData,Assumptions" "Process:Calc,Adj" "Output:Summary"
 
 As a library:
-    from excel_swimlane import build_pipeline
+    from Swimlane_Flow import build_pipeline
     edges, G, lanes = build_pipeline("workbook.xlsx")
 """
 
@@ -191,7 +191,12 @@ def _break_cycles_for_layout(G: nx.DiGraph) -> nx.DiGraph:
 
 
 def compute_positions(G: nx.DiGraph, lanes: Dict[str, str], lane_order: List[str]):
-    """x = longest-path depth from any source (acyclic view), y = lane index."""
+    """x = longest-path depth from any source (acyclic view).
+    Also returns lane_capacity: the busiest single depth-column within each
+    lane — i.e. how many sheets are ever stacked at the same (lane, depth)
+    cell. The renderers use this to size each band tall enough to hold its
+    most crowded column, so nodes can never spill into a neighboring lane
+    (the bug that made large workbooks render outside their swimlane)."""
     H = _break_cycles_for_layout(G)
     depth = {n: 0 for n in H.nodes}
     for n in nx.topological_sort(H):
@@ -200,16 +205,40 @@ def compute_positions(G: nx.DiGraph, lanes: Dict[str, str], lane_order: List[str
 
     lane_index = {name: i for i, name in enumerate(lane_order)}
     pos = {}
-    # stagger nodes within the same (lane, depth) cell so labels don't overlap
     seen_slots: Dict[Tuple[int, int], int] = defaultdict(int)
     for node in G.nodes:
-        lane = lanes.get(node, "Process")
+        lane = lanes.get(node, lane_order[-1] if lane_order else "Process")
         li = lane_index.get(lane, len(lane_order) - 1)
         d = depth.get(node, 0)
         slot = seen_slots[(li, d)]
         seen_slots[(li, d)] += 1
         pos[node] = (d, li, slot)
-    return pos
+
+    cell_counts: Dict[Tuple[int, int], int] = defaultdict(int)
+    for (li, d), n in seen_slots.items():
+        cell_counts[(li, d)] = max(cell_counts[(li, d)], n)
+    lane_capacity = {lane: 1 for lane in lane_order}
+    for (li, d), n in cell_counts.items():
+        lane = lane_order[li] if 0 <= li < len(lane_order) else lane_order[-1]
+        lane_capacity[lane] = max(lane_capacity[lane], n)
+
+    return pos, lane_capacity
+
+
+def _lane_bands(lane_order: List[str], lane_capacity: Dict[str, int], node_spacing: float, padding: float):
+    """Stack lanes top-to-bottom (lane_order[0] highest) with each band's
+    height derived from how many nodes it actually needs to hold, and return
+    each lane's (bottom, height) plus the total diagram height."""
+    bottoms: Dict[str, float] = {}
+    heights: Dict[str, float] = {}
+    y = 0.0
+    for lane in reversed(lane_order):
+        cap = max(lane_capacity.get(lane, 1), 1)
+        h = cap * node_spacing + padding
+        bottoms[lane] = y
+        heights[lane] = h
+        y += h
+    return bottoms, heights, y
 
 
 # ---------------------------------------------------------------------------
@@ -290,34 +319,37 @@ def swimlane_figure(
     if lane_order is None:
         lane_order = _default_lane_order(lanes)
 
-    pos = compute_positions(G, lanes, lane_order)
+    pos, lane_capacity = compute_positions(G, lanes, lane_order)
     max_depth = max((p[0] for p in pos.values()), default=0)
-    max_slot = max((p[2] for p in pos.values()), default=0)
 
-    col_w, lane_h, slot_h = 2.6, 3.0, 1.4
+    node_spacing, band_padding = 0.85, 0.9
+    bottoms, heights, total_height = _lane_bands(lane_order, lane_capacity, node_spacing, band_padding)
+
+    col_w = 2.6
     fig_w = max(8, (max_depth + 1) * col_w + 2)
-    fig_h = max(4, len(lane_order) * lane_h)
+    fig_h = max(4, total_height)
 
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-    n_lanes = len(lane_order)
 
-    # lane background bands + labels (Input/Source data at top, reading order top-down)
+    # lane background bands + labels (lane_order[0] at top, reading order top-down)
     for i, lane in enumerate(lane_order):
-        row = n_lanes - 1 - i
-        y0 = row * lane_h
+        y0 = bottoms[lane]
+        h = heights[lane]
         color = lane_color(lane, i)
-        ax.axhspan(y0, y0 + lane_h, color=color, alpha=0.35, zorder=0)
+        ax.axhspan(y0, y0 + h, color=color, alpha=0.35, zorder=0)
         ax.text(
-            -1.3, y0 + lane_h / 2, lane,
+            -1.3, y0 + h / 2, lane,
             fontsize=13, fontweight="bold", va="center", ha="right",
         )
 
-    # node coordinates
+    # node coordinates — each node sits inside its own lane's band, top-aligned
+    # by slot, so no node can ever land in a neighboring lane regardless of
+    # how many sheets share that lane/depth.
     xy = {}
     for node, (d, li, slot) in pos.items():
-        row = n_lanes - 1 - li
+        lane = lane_order[li] if 0 <= li < len(lane_order) else lane_order[-1]
         x = d * col_w
-        y = row * lane_h + lane_h / 2 + (slot - max_slot / 2) * slot_h * 0.6
+        y = bottoms[lane] + band_padding / 2 + (slot + 0.5) * node_spacing
         xy[node] = (x, y)
 
     # draw edges first (behind boxes)
@@ -349,7 +381,7 @@ def swimlane_figure(
         ax.text(x, y, node, ha="center", va="center", fontsize=9.5, zorder=3)
 
     ax.set_xlim(-3, (max_depth + 1) * col_w)
-    ax.set_ylim(0, len(lane_order) * lane_h)
+    ax.set_ylim(0, total_height)
     ax.axis("off")
     ax.set_title(title, fontsize=15, fontweight="bold", pad=14)
     plt.tight_layout()
@@ -402,21 +434,30 @@ def swimlane_html_string(
     if lane_order is None:
         lane_order = _default_lane_order(lanes)
 
-    pos = compute_positions(G, lanes, lane_order)
+    pos, lane_capacity = compute_positions(G, lanes, lane_order)
     lane_index = {name: i for i, name in enumerate(lane_order)}
+    max_depth = max((p[0] for p in pos.values()), default=0)
+
+    node_spacing, band_padding = 55, 70
+    bottoms, heights, total_height = _lane_bands(lane_order, lane_capacity, node_spacing, band_padding)
+
+    def to_canvas_y(world_y: float) -> float:
+        return total_height - world_y
 
     nodes = []
     for node, (d, li, slot) in pos.items():
+        lane = lane_order[li] if 0 <= li < len(lane_order) else lane_order[-1]
         color = lane_color(lanes.get(node, lane_order[-1]), li)
+        world_y = bottoms[lane] + band_padding / 2 + (slot + 0.5) * node_spacing
         nodes.append({
             "id": node,
             "label": node,
             "x": d * 220,
-            "y": li * 180 + slot * 40,  # top-down: Input (li=0) rendered first row
+            "y": to_canvas_y(world_y),
             "fixed": {"x": True, "y": True},
             "color": {"background": color, "border": "#333"},
             "shape": "box",
-            "title": f"Lane: {lanes.get(node, 'Process')}",
+            "title": f"Lane: {lanes.get(node, lane_order[-1])}",
         })
 
     edges = []
@@ -430,9 +471,17 @@ def swimlane_html_string(
             "title": detail,
         })
 
+    x_min, x_max = -260, (max_depth + 1) * 220
     lane_bands = []
-    for name, i in lane_index.items():
-        lane_bands.append({"name": name, "y": i * 180})
+    for i, lane in enumerate(lane_order):
+        canvas_top = to_canvas_y(bottoms[lane] + heights[lane])
+        canvas_bottom = to_canvas_y(bottoms[lane])
+        lane_bands.append({
+            "name": lane,
+            "top": canvas_top,
+            "bottom": canvas_bottom,
+            "color": lane_color(lane, i),
+        })
 
     vis_lib_tag = _vis_network_script_tag()
 
@@ -446,24 +495,64 @@ def swimlane_html_string(
   body {{ font-family: -apple-system, Segoe UI, Arial, sans-serif; margin: 0; }}
   #header {{ padding: 14px 20px; background: #1a1a2e; color: white; }}
   #network {{ width: 100%; height: calc(100vh - 56px); }}
-  .lane-label {{ position: absolute; left: 8px; font-weight: bold; font-size: 13px; color: #444; }}
+  #load-error {{ display: none; padding: 30px; color: #a00; font-family: monospace;
+                 white-space: pre-wrap; font-size: 13px; }}
 </style>
 </head>
 <body>
 <div id="header"><h2 style="margin:0;font-size:16px;">{title}</h2></div>
+<div id="load-error"></div>
 <div id="network"></div>
 <script>
-  const nodes = new vis.DataSet({json.dumps(nodes)});
-  const edges = new vis.DataSet({json.dumps(edges)});
-  const container = document.getElementById('network');
-  const data = {{ nodes, edges }};
-  const options = {{
-    physics: false,
-    interaction: {{ hover: true, dragNodes: false, zoomView: true }},
-    edges: {{ font: {{ align: 'top', size: 11 }}, smooth: {{ type: 'cubicBezier', roundness: 0.4 }} }},
-    nodes: {{ font: {{ size: 13 }}, margin: 10 }}
-  }};
-  new vis.Network(container, data, options);
+  function showLoadError(msg) {{
+    var box = document.getElementById('load-error');
+    var net = document.getElementById('network');
+    box.style.display = 'block';
+    net.style.display = 'none';
+    box.textContent = 'Diagram failed to load.\\n\\n' + msg +
+      '\\n\\nMost likely cause: the vis-network script did not load ' +
+      '(offline machine + assets/vis-network.min.js missing next to ' +
+      'Swimlane_Flow.py, or the CDN fallback is blocked on this network).';
+  }}
+  window.addEventListener('error', function(e) {{
+    showLoadError(String(e.message || e.type));
+  }}, true);
+  if (typeof vis === 'undefined') {{
+    showLoadError('The vis-network library did not load (typeof vis === "undefined").');
+  }} else {{
+    try {{
+      const lanes = {json.dumps(lane_bands)};
+      const nodes = new vis.DataSet({json.dumps(nodes)});
+      const edges = new vis.DataSet({json.dumps(edges)});
+      const container = document.getElementById('network');
+      const data = {{ nodes, edges }};
+      const options = {{
+        physics: false,
+        interaction: {{ hover: true, dragNodes: false, zoomView: true }},
+        edges: {{ font: {{ align: 'top', size: 11 }}, smooth: {{ type: 'cubicBezier', roundness: 0.4 }} }},
+        nodes: {{ font: {{ size: 13 }}, margin: 10 }}
+      }};
+      const network = new vis.Network(container, data, options);
+      network.on('beforeDrawing', function(ctx) {{
+        ctx.save();
+        ctx.textAlign = 'right';
+        ctx.textBaseline = 'middle';
+        ctx.font = 'bold 14px -apple-system, Segoe UI, Arial, sans-serif';
+        lanes.forEach(function(band) {{
+          ctx.fillStyle = band.color + '59';  // ~35% alpha
+          ctx.fillRect({x_min}, band.top, {x_max} - ({x_min}), band.bottom - band.top);
+          ctx.fillStyle = '#333333';
+          ctx.fillText(band.name, {x_min} - 12, (band.top + band.bottom) / 2);
+        }});
+        ctx.restore();
+      }});
+      network.once('afterDrawing', function() {{
+        network.fit({{ animation: false }});
+      }});
+    }} catch (err) {{
+      showLoadError(String(err));
+    }}
+  }}
 </script>
 </body>
 </html>"""
