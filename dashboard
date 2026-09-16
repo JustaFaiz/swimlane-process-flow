@@ -1,13 +1,16 @@
 """
-streamlit_app.py — Excel Cross-Sheet Process Flow Mapper
+dashboard.py — Excel Cross-Sheet Process Flow Mapper
 
 Run with:
-    streamlit run streamlit_app.py
+    streamlit run dashboard.py
 
 Workflow:
     1. Upload an .xlsx workbook.
-    2. Assign every sheet to one of the 5 process lanes:
-       Source data -> Tax adjustments -> CT entries -> Consolidation -> Output
+    2. Assign every sheet to one of the 5 process categories:
+       Source data -> Tax adjustments -> [CT entries] -> Consolidation -> Output
+       (CT entries is optional per flow — a diagram only shows that band if a
+        sheet in it is actually used by that flow; not every adjustment
+        routes through CT entries.)
     3. View the full swimlane diagram (interactive or static).
     4. Drill down into any single sheet to see the exact cell-level formulas
        linking it to other sheets.
@@ -24,7 +27,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from excel_swimlane import (
+from Swimlane_Flow import (
     ancestors_subgraph,
     build_sheet_graph,
     extract_cross_sheet_refs,
@@ -72,15 +75,22 @@ def open_in_browser_tab(html: str, filename_hint: str):
 def render(G, lanes, title, key_prefix: str, height: int = 620):
     """Static preview inline (always reliable) + a button to pop the full
     interactive version open in its own browser tab, plus a download
-    fallback for remote/headless setups."""
+    fallback for remote/headless setups.
+
+    Lane bands are shown only if a sheet in *this* view actually uses them —
+    CT entries (or any lane) is skipped for a flow that never touches it,
+    rather than always drawing all 5 bands regardless of content."""
     if G.number_of_nodes() == 0:
         st.info("Nothing to show — no sheets in this view.")
         return
 
-    fig = swimlane_figure(G, lanes, lane_order=LANES, title=title)
+    used_lanes = {lanes.get(n) for n in G.nodes}
+    active_order = [l for l in LANES if l in used_lanes] or LANES
+
+    fig = swimlane_figure(G, lanes, lane_order=active_order, title=title)
     st.pyplot(fig, use_container_width=True)
 
-    html = swimlane_html_string(G, lanes, lane_order=LANES, title=title)
+    html = swimlane_html_string(G, lanes, lane_order=active_order, title=title)
     c1, c2 = st.columns([1, 1])
     with c1:
         if st.button("Open interactive version in browser tab", key=f"{key_prefix}_open"):
@@ -151,10 +161,17 @@ for lane in LANES:
             if cleaned != other_vals:
                 st.session_state[other_key] = cleaned
 
+assigned_now = set()
 for lane in LANES:
+    assigned_now |= set(st.session_state.get(f"ms_{lane}", []))
+unassigned_now = [s for s in sorted_sheets if s not in assigned_now]
+
+for lane in LANES:
+    own = st.session_state.get(f"ms_{lane}", [])
+    options_for_lane = sorted(set(own) | set(unassigned_now))
     st.multiselect(
         lane,
-        options=sorted_sheets,
+        options=options_for_lane,
         key=f"ms_{lane}",
         placeholder=f"Sheets in {lane}...",
     )
