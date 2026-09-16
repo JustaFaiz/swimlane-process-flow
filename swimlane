@@ -1,0 +1,511 @@
+"""
+excel_swimlane.py
+
+Builds a swimlane process-flow diagram from an Excel workbook by tracing
+cross-sheet formula references (cell-level lineage -> sheet-level graph).
+
+Pipeline:
+    1. extract_cross_sheet_refs()  -> raw cell-to-cell edges from formulas
+    2. build_sheet_graph()         -> aggregated sheet-to-sheet DiGraph
+    3. classify_lanes()            -> assigns each sheet to Input/Process/Output
+                                       (or user-supplied lanes)
+    4. render_swimlane()           -> static PNG (matplotlib, no external deps)
+    5. render_swimlane_html()      -> interactive HTML (vis-network via CDN)
+
+Usage (CLI):
+    python excel_swimlane.py workbook.xlsx --out swimlane.png
+    python excel_swimlane.py workbook.xlsx --out swimlane.html --html
+    python excel_swimlane.py workbook.xlsx --out swimlane.png \
+        --lanes "Input:RawData,Assumptions" "Process:Calc,Adj" "Output:Summary"
+
+As a library:
+    from excel_swimlane import build_pipeline
+    edges, G, lanes = build_pipeline("workbook.xlsx")
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import networkx as nx
+import openpyxl
+
+
+# ---------------------------------------------------------------------------
+# 1. Formula parsing / cross-sheet reference extraction
+# ---------------------------------------------------------------------------
+
+# Matches: SheetName!A1   |  'Sheet Name'!A1:B10   |  'Sheet''s'!$A$1
+_SHEET_REF = re.compile(
+    r"(?:'((?:[^']|'')+)'|([A-Za-z_][A-Za-z0-9_.]*))"   # sheet name (quoted or bare)
+    r"!"
+    r"(\$?[A-Z]{1,3}\$?[0-9]+(?::\$?[A-Z]{1,3}\$?[0-9]+)?)"  # cell or range
+)
+
+
+@dataclass
+class RefEdge:
+    src_sheet: str
+    src_ref: str
+    tgt_sheet: str
+    tgt_cell: str
+    formula: str
+
+
+def extract_cross_sheet_refs(workbook_path: str) -> List[RefEdge]:
+    """Scan every formula cell in the workbook and pull out any references
+    that point at a *different* sheet than the one the formula lives in.
+
+    Returns a flat list of RefEdge(src_sheet, src_ref, tgt_sheet, tgt_cell, formula)
+    where the direction is: src_sheet feeds INTO tgt_sheet (data flows from the
+    referenced sheet to the sheet holding the formula).
+    """
+    wb = openpyxl.load_workbook(workbook_path, data_only=False)
+    edges: List[RefEdge] = []
+
+    for ws in wb.worksheets:
+        tgt_sheet = ws.title
+        for row in ws.iter_rows():
+            for cell in row:
+                val = cell.value
+                if not isinstance(val, str) or not val.startswith("="):
+                    continue
+
+                for m in _SHEET_REF.finditer(val):
+                    raw_sheet = (m.group(1) or m.group(2) or "").replace("''", "'")
+                    src_ref = m.group(3)
+                    if raw_sheet and raw_sheet != tgt_sheet:
+                        edges.append(
+                            RefEdge(
+                                src_sheet=raw_sheet,
+                                src_ref=src_ref,
+                                tgt_sheet=tgt_sheet,
+                                tgt_cell=cell.coordinate,
+                                formula=val,
+                            )
+                        )
+    wb.close()
+    return edges
+
+
+# ---------------------------------------------------------------------------
+# 2. Aggregate to a sheet-level DiGraph
+# ---------------------------------------------------------------------------
+
+def build_sheet_graph(edges: List[RefEdge]) -> nx.DiGraph:
+    """Collapse cell-level RefEdges into a sheet-to-sheet DiGraph.
+    Edge weight = number of formula links between the two sheets.
+    Edge attr 'detail' = list of (src_ref, tgt_cell, formula) samples (capped).
+    """
+    G = nx.DiGraph()
+    counts: Dict[Tuple[str, str], int] = defaultdict(int)
+    detail: Dict[Tuple[str, str], list] = defaultdict(list)
+
+    for e in edges:
+        key = (e.src_sheet, e.tgt_sheet)
+        counts[key] += 1
+        if len(detail[key]) < 8:  # cap sample detail per edge
+            detail[key].append(f"{e.src_sheet}!{e.src_ref} -> {e.tgt_sheet}!{e.tgt_cell}")
+        G.add_node(e.src_sheet)
+        G.add_node(e.tgt_sheet)
+
+    for (src, tgt), n in counts.items():
+        G.add_edge(src, tgt, weight=n, detail=detail[(src, tgt)])
+
+    return G
+
+
+# ---------------------------------------------------------------------------
+# 3. Lane classification
+# ---------------------------------------------------------------------------
+
+def classify_lanes(
+    G: nx.DiGraph,
+    overrides: Optional[Dict[str, str]] = None,
+) -> Dict[str, str]:
+    """Assign each sheet to a lane: Input / Process / Output.
+
+    Heuristic:
+      - no incoming cross-sheet refs, has outgoing  -> Input
+      - no outgoing cross-sheet refs, has incoming   -> Output
+      - both incoming and outgoing                   -> Process
+      - isolated node (no refs either way)            -> Process (unclassified)
+
+    `overrides` lets you force specific sheets into a lane, e.g.
+      {"RawData": "Input", "Summary": "Output"}
+    """
+    lanes: Dict[str, str] = {}
+    for node in G.nodes:
+        indeg = G.in_degree(node)
+        outdeg = G.out_degree(node)
+        if indeg == 0 and outdeg > 0:
+            lanes[node] = "Input"
+        elif outdeg == 0 and indeg > 0:
+            lanes[node] = "Output"
+        else:
+            lanes[node] = "Process"
+
+    if overrides:
+        lanes.update(overrides)
+
+    return lanes
+
+
+def parse_lane_overrides(lane_args: Optional[List[str]]) -> Dict[str, str]:
+    """Parse CLI --lanes "Input:Sheet1,Sheet2" "Output:Sheet3" into overrides dict."""
+    overrides: Dict[str, str] = {}
+    if not lane_args:
+        return overrides
+    for spec in lane_args:
+        lane_name, _, sheets = spec.partition(":")
+        for s in sheets.split(","):
+            s = s.strip()
+            if s:
+                overrides[s] = lane_name.strip()
+    return overrides
+
+
+# ---------------------------------------------------------------------------
+# 4. Layout: x = topological depth, y = lane index
+# ---------------------------------------------------------------------------
+
+def _break_cycles_for_layout(G: nx.DiGraph) -> nx.DiGraph:
+    """Return an acyclic copy for layout purposes only (drops back-edges).
+    The original graph (with cycles intact) is what gets rendered/exported;
+    this copy is only used to compute x-positions."""
+    H = G.copy()
+    try:
+        while True:
+            cycle = nx.find_cycle(H)
+            H.remove_edge(*cycle[0][:2])
+    except nx.NetworkXNoCycle:
+        pass
+    return H
+
+
+def compute_positions(G: nx.DiGraph, lanes: Dict[str, str], lane_order: List[str]):
+    """x = longest-path depth from any source (acyclic view), y = lane index."""
+    H = _break_cycles_for_layout(G)
+    depth = {n: 0 for n in H.nodes}
+    for n in nx.topological_sort(H):
+        for succ in H.successors(n):
+            depth[succ] = max(depth[succ], depth[n] + 1)
+
+    lane_index = {name: i for i, name in enumerate(lane_order)}
+    pos = {}
+    # stagger nodes within the same (lane, depth) cell so labels don't overlap
+    seen_slots: Dict[Tuple[int, int], int] = defaultdict(int)
+    for node in G.nodes:
+        lane = lanes.get(node, "Process")
+        li = lane_index.get(lane, len(lane_order) - 1)
+        d = depth.get(node, 0)
+        slot = seen_slots[(li, d)]
+        seen_slots[(li, d)] += 1
+        pos[node] = (d, li, slot)
+    return pos
+
+
+# ---------------------------------------------------------------------------
+# Shared lane palette (used by both the matplotlib and HTML renderers)
+# ---------------------------------------------------------------------------
+
+LANE_COLORS = {
+    # generic 3-lane defaults (CLI / library default)
+    "Input": "#cfe8ff",
+    "Process": "#fff3cf",
+    "Output": "#d7f7d1",
+    # tax-process 5-lane set used by the Streamlit dashboard
+    "Source data": "#cfe8ff",
+    "Tax adjustments": "#ffe3b3",
+    "CT entries": "#fff3cf",
+    "Consolidation": "#e6d7f7",
+}
+_FALLBACK_COLORS = ["#e6d7f7", "#ffd9d0", "#d0f0f7", "#f7d0e8"]
+
+
+def _default_lane_order(lanes: Dict[str, str]) -> List[str]:
+    default = ["Input", "Process", "Output"]
+    extra = sorted({l for l in lanes.values() if l not in default})
+    return default + extra
+
+
+def lane_color(lane: str, fallback_index: int = 0) -> str:
+    return LANE_COLORS.get(lane, _FALLBACK_COLORS[fallback_index % len(_FALLBACK_COLORS)])
+
+
+def ancestors_subgraph(G: nx.DiGraph, target: str) -> nx.DiGraph:
+    """Return the induced subgraph of `target` plus every sheet that feeds
+    into it (directly or transitively) — i.e. the single end-to-end flow
+    that produces `target`. Used for the 'trace this output' drill-down."""
+    if target not in G:
+        return G.subgraph([]).copy()
+    nodes = nx.ancestors(G, target) | {target}
+    return G.subgraph(nodes).copy()
+
+
+def suggest_lane(in_degree: int, out_degree: int) -> str:
+    """Cheap heuristic used only to pre-fill the Streamlit category pickers;
+    the person always has the final say on classification."""
+    if in_degree == 0 and out_degree > 0:
+        return "Source data"
+    if out_degree == 0 and in_degree > 0:
+        return "Output"
+    if in_degree == 0 and out_degree == 0:
+        return "Source data"
+    return "Tax adjustments"
+
+
+def list_sheet_names(workbook_path_or_buffer) -> List[str]:
+    """Fast sheet-name listing (read_only mode) — used to populate the
+    category picker before running the full formula scan."""
+    wb = openpyxl.load_workbook(workbook_path_or_buffer, read_only=True)
+    names = list(wb.sheetnames)
+    wb.close()
+    return names
+
+
+# ---------------------------------------------------------------------------
+# 5a. Static rendering with matplotlib (no external binaries required)
+# ---------------------------------------------------------------------------
+
+def swimlane_figure(
+    G: nx.DiGraph,
+    lanes: Dict[str, str],
+    lane_order: Optional[List[str]] = None,
+    title: str = "Workbook Process Flow (Swimlane)",
+):
+    """Build and return a matplotlib Figure (does not save to disk) —
+    the form used by the Streamlit dashboard via st.pyplot(fig)."""
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import FancyBboxPatch
+    from matplotlib.patches import FancyArrowPatch
+
+    if lane_order is None:
+        lane_order = _default_lane_order(lanes)
+
+    pos = compute_positions(G, lanes, lane_order)
+    max_depth = max((p[0] for p in pos.values()), default=0)
+    max_slot = max((p[2] for p in pos.values()), default=0)
+
+    col_w, lane_h, slot_h = 2.6, 3.0, 1.4
+    fig_w = max(8, (max_depth + 1) * col_w + 2)
+    fig_h = max(4, len(lane_order) * lane_h)
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    n_lanes = len(lane_order)
+
+    # lane background bands + labels (Input/Source data at top, reading order top-down)
+    for i, lane in enumerate(lane_order):
+        row = n_lanes - 1 - i
+        y0 = row * lane_h
+        color = lane_color(lane, i)
+        ax.axhspan(y0, y0 + lane_h, color=color, alpha=0.35, zorder=0)
+        ax.text(
+            -1.3, y0 + lane_h / 2, lane,
+            fontsize=13, fontweight="bold", va="center", ha="right",
+        )
+
+    # node coordinates
+    xy = {}
+    for node, (d, li, slot) in pos.items():
+        row = n_lanes - 1 - li
+        x = d * col_w
+        y = row * lane_h + lane_h / 2 + (slot - max_slot / 2) * slot_h * 0.6
+        xy[node] = (x, y)
+
+    # draw edges first (behind boxes)
+    for u, v, data in G.edges(data=True):
+        x1, y1 = xy[u]
+        x2, y2 = xy[v]
+        arrow = FancyArrowPatch(
+            (x1, y1), (x2, y2),
+            connectionstyle="arc3,rad=0.15",
+            arrowstyle="-|>", mutation_scale=14,
+            color="#555555", linewidth=1 + min(data.get("weight", 1) / 5, 3),
+            zorder=1, shrinkA=28, shrinkB=28,
+        )
+        ax.add_patch(arrow)
+        mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+        ax.text(mx, my, str(data.get("weight", "")), fontsize=8, color="#333",
+                ha="center", va="center",
+                bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.8))
+
+    # draw sheet nodes
+    for node, (x, y) in xy.items():
+        w, h = 2.0, 0.6
+        box = FancyBboxPatch(
+            (x - w / 2, y - h / 2), w, h,
+            boxstyle="round,pad=0.05,rounding_size=0.08",
+            linewidth=1.4, edgecolor="#333333", facecolor="white", zorder=2,
+        )
+        ax.add_patch(box)
+        ax.text(x, y, node, ha="center", va="center", fontsize=9.5, zorder=3)
+
+    ax.set_xlim(-3, (max_depth + 1) * col_w)
+    ax.set_ylim(0, len(lane_order) * lane_h)
+    ax.axis("off")
+    ax.set_title(title, fontsize=15, fontweight="bold", pad=14)
+    plt.tight_layout()
+    return fig
+
+
+def render_swimlane(
+    G: nx.DiGraph,
+    lanes: Dict[str, str],
+    out_path: str,
+    lane_order: Optional[List[str]] = None,
+    title: str = "Workbook Process Flow (Swimlane)",
+):
+    """CLI/file convenience wrapper around swimlane_figure()."""
+    import matplotlib.pyplot as plt
+    fig = swimlane_figure(G, lanes, lane_order=lane_order, title=title)
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# 5b. Interactive rendering (vis-network via CDN, self-contained HTML)
+# ---------------------------------------------------------------------------
+
+def swimlane_html_string(
+    G: nx.DiGraph,
+    lanes: Dict[str, str],
+    lane_order: Optional[List[str]] = None,
+    title: str = "Workbook Process Flow (Swimlane)",
+) -> str:
+    """Build the self-contained interactive HTML (vis-network) and return it
+    as a string — the form used by Streamlit via st.components.v1.html()."""
+    if lane_order is None:
+        lane_order = _default_lane_order(lanes)
+
+    pos = compute_positions(G, lanes, lane_order)
+    lane_index = {name: i for i, name in enumerate(lane_order)}
+
+    nodes = []
+    for node, (d, li, slot) in pos.items():
+        color = lane_color(lanes.get(node, lane_order[-1]), li)
+        nodes.append({
+            "id": node,
+            "label": node,
+            "x": d * 220,
+            "y": li * 180 + slot * 40,  # top-down: Input (li=0) rendered first row
+            "fixed": {"x": True, "y": True},
+            "color": {"background": color, "border": "#333"},
+            "shape": "box",
+            "title": f"Lane: {lanes.get(node, 'Process')}",
+        })
+
+    edges = []
+    for u, v, data in G.edges(data=True):
+        detail = "<br>".join(data.get("detail", []))
+        edges.append({
+            "from": u, "to": v,
+            "arrows": "to",
+            "label": str(data.get("weight", "")),
+            "width": 1 + min(data.get("weight", 1) / 5, 4),
+            "title": detail,
+        })
+
+    lane_bands = []
+    for name, i in lane_index.items():
+        lane_bands.append({"name": name, "y": i * 180})
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>{title}</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.9/vis-network.min.js"></script>
+<style>
+  body {{ font-family: -apple-system, Segoe UI, Arial, sans-serif; margin: 0; }}
+  #header {{ padding: 14px 20px; background: #1a1a2e; color: white; }}
+  #network {{ width: 100%; height: calc(100vh - 56px); }}
+  .lane-label {{ position: absolute; left: 8px; font-weight: bold; font-size: 13px; color: #444; }}
+</style>
+</head>
+<body>
+<div id="header"><h2 style="margin:0;font-size:16px;">{title}</h2></div>
+<div id="network"></div>
+<script>
+  const nodes = new vis.DataSet({json.dumps(nodes)});
+  const edges = new vis.DataSet({json.dumps(edges)});
+  const container = document.getElementById('network');
+  const data = {{ nodes, edges }};
+  const options = {{
+    physics: false,
+    interaction: {{ hover: true, dragNodes: false, zoomView: true }},
+    edges: {{ font: {{ align: 'top', size: 11 }}, smooth: {{ type: 'cubicBezier', roundness: 0.4 }} }},
+    nodes: {{ font: {{ size: 13 }}, margin: 10 }}
+  }};
+  new vis.Network(container, data, options);
+</script>
+</body>
+</html>"""
+
+    return html
+
+
+def render_swimlane_html(
+    G: nx.DiGraph,
+    lanes: Dict[str, str],
+    out_path: str,
+    lane_order: Optional[List[str]] = None,
+    title: str = "Workbook Process Flow (Swimlane)",
+):
+    """CLI/file convenience wrapper around swimlane_html_string()."""
+    html = swimlane_html_string(G, lanes, lane_order=lane_order, title=title)
+    Path(out_path).write_text(html, encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Pipeline + CLI
+# ---------------------------------------------------------------------------
+
+def build_pipeline(workbook_path: str, lane_overrides: Optional[Dict[str, str]] = None):
+    edges = extract_cross_sheet_refs(workbook_path)
+    G = build_sheet_graph(edges)
+    lanes = classify_lanes(G, overrides=lane_overrides)
+    return edges, G, lanes
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Build a swimlane process-flow diagram from an Excel workbook.")
+    ap.add_argument("workbook", help="Path to .xlsx workbook")
+    ap.add_argument("--out", default="swimlane.png", help="Output file path (.png or .html)")
+    ap.add_argument("--html", action="store_true", help="Render interactive HTML instead of static PNG")
+    ap.add_argument(
+        "--lanes", nargs="*",
+        help='Manual lane overrides, e.g. --lanes "Input:Sheet1,Sheet2" "Output:Sheet3"',
+    )
+    ap.add_argument("--dump-edges", help="Optional path to dump raw cell-level edges as JSON")
+    args = ap.parse_args()
+
+    overrides = parse_lane_overrides(args.lanes)
+    edges, G, lanes = build_pipeline(args.workbook, overrides)
+
+    print(f"Found {len(edges)} cross-sheet formula references across {G.number_of_nodes()} sheets.")
+    for sheet, lane in sorted(lanes.items(), key=lambda x: x[1]):
+        print(f"  [{lane:8s}] {sheet}")
+
+    if args.dump_edges:
+        Path(args.dump_edges).write_text(
+            json.dumps([e.__dict__ for e in edges], indent=2), encoding="utf-8"
+        )
+
+    if args.html or args.out.endswith(".html"):
+        render_swimlane_html(G, lanes, args.out)
+    else:
+        render_swimlane(G, lanes, args.out)
+
+    print(f"Swimlane diagram written to {args.out}")
+
+
+if __name__ == "__main__":
+    main()
