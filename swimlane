@@ -371,8 +371,25 @@ def render_swimlane(
 
 
 # ---------------------------------------------------------------------------
-# 5b. Interactive rendering (vis-network via CDN, self-contained HTML)
+# 5b. Interactive rendering (vis-network, embedded inline — no CDN required)
 # ---------------------------------------------------------------------------
+
+# The vis-network UMD bundle is shipped as assets/vis-network.min.js next to
+# this script and inlined directly into the generated HTML. This makes the
+# diagram fully self-contained and immune to corporate firewalls/proxies
+# blocking a CDN fetch (the most common cause of "blank diagram" in Streamlit
+# or an offline machine). If the asset is missing for any reason, we fall
+# back to the public CDN so the script still works out of the box.
+_VIS_NETWORK_CDN = "https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.9/vis-network.min.js"
+
+
+def _vis_network_script_tag() -> str:
+    asset_path = Path(__file__).resolve().parent / "assets" / "vis-network.min.js"
+    if asset_path.exists():
+        js = asset_path.read_text(encoding="utf-8")
+        return f"<script>\n{js}\n</script>"
+    return f'<script src="{_VIS_NETWORK_CDN}"></script>'
+
 
 def swimlane_html_string(
     G: nx.DiGraph,
@@ -417,12 +434,14 @@ def swimlane_html_string(
     for name, i in lane_index.items():
         lane_bands.append({"name": name, "y": i * 180})
 
+    vis_lib_tag = _vis_network_script_tag()
+
     html = f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <title>{title}</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.9/vis-network.min.js"></script>
+{vis_lib_tag}
 <style>
   body {{ font-family: -apple-system, Segoe UI, Arial, sans-serif; margin: 0; }}
   #header {{ padding: 14px 20px; background: #1a1a2e; color: white; }}
