@@ -148,76 +148,50 @@ st.success(
 )
 
 # ---------------------------------------------------------------------------
-# 1. Lane assignment — 5 multiselects (one per category), not one per sheet
+# 1. Lane assignment — one row per sheet, each with its own category dropdown
 # ---------------------------------------------------------------------------
 st.header("1. Assign sheets to the 5 process categories")
 st.caption(
-    "Pick which sheets belong to each category. A sheet can only count once — "
-    "if you add it to a second box it's removed from wherever it was before."
+    "Click a row's Category cell to change it — reassigning a sheet is always "
+    "just editing that one cell, whatever category it's currently in. "
+    "Click the column header to sort, or use the search box below."
 )
+
+sorted_sheets = sorted(all_sheets)
 
 if st.session_state.get("_wb_key") != uploaded.name:
     # (Re)initialize from the heuristic guess only when a new workbook is loaded
     seed = {s: suggest_lane(G.in_degree(s), G.out_degree(s)) for s in all_sheets}
-    for lane in LANES:
-        st.session_state[f"ms_{lane}"] = sorted([s for s, l in seed.items() if l == lane])
+    st.session_state.lane_df = pd.DataFrame(
+        {"Sheet": sorted_sheets, "Category": [seed[s] for s in sorted_sheets]}
+    )
     st.session_state._wb_key = uploaded.name
-    st.session_state._prev_ms = {lane: list(st.session_state[f"ms_{lane}"]) for lane in LANES}
 
-if "_prev_ms" not in st.session_state:
-    st.session_state._prev_ms = {lane: list(st.session_state.get(f"ms_{lane}", [])) for lane in LANES}
+search = st.text_input("Filter sheets by name", key="sheet_filter")
+display_df = st.session_state.lane_df
+if search:
+    display_df = display_df[display_df["Sheet"].str.contains(search, case=False, na=False)]
 
-sorted_sheets = sorted(all_sheets)
+edited = st.data_editor(
+    display_df,
+    column_config={
+        "Sheet": st.column_config.TextColumn("Sheet", disabled=True),
+        "Category": st.column_config.SelectboxColumn("Category", options=LANES, required=True),
+    },
+    hide_index=True,
+    use_container_width=True,
+    height=500,
+    key="lane_editor",
+)
 
-# Detect which single multiselect just changed vs. last run, and drop any
-# newly-added sheet out of whichever other box it used to sit in — this is
-# what keeps 161 sheets from ending up double- or un-assigned as you sort them.
-for lane in LANES:
-    current = st.session_state.get(f"ms_{lane}", [])
-    previous = st.session_state._prev_ms.get(lane, [])
-    newly_added = set(current) - set(previous)
-    if newly_added:
-        for other in LANES:
-            if other == lane:
-                continue
-            other_key = f"ms_{other}"
-            other_vals = st.session_state.get(other_key, [])
-            cleaned = [s for s in other_vals if s not in newly_added]
-            if cleaned != other_vals:
-                st.session_state[other_key] = cleaned
+# Merge edits back (the editor only shows the filtered subset when searching,
+# so write those rows back into the full table rather than replacing it).
+st.session_state.lane_df.set_index("Sheet", inplace=True)
+edited_indexed = edited.set_index("Sheet")
+st.session_state.lane_df.update(edited_indexed)
+st.session_state.lane_df.reset_index(inplace=True)
 
-assigned_now = set()
-for lane in LANES:
-    assigned_now |= set(st.session_state.get(f"ms_{lane}", []))
-unassigned_now = [s for s in sorted_sheets if s not in assigned_now]
-
-for lane in LANES:
-    own = st.session_state.get(f"ms_{lane}", [])
-    options_for_lane = sorted(set(own) | set(unassigned_now))
-    st.multiselect(
-        lane,
-        options=options_for_lane,
-        key=f"ms_{lane}",
-        placeholder=f"Sheets in {lane}...",
-    )
-
-st.session_state._prev_ms = {lane: list(st.session_state[f"ms_{lane}"]) for lane in LANES}
-
-lane_map = {}
-for lane in LANES:
-    for s in st.session_state[f"ms_{lane}"]:
-        lane_map[s] = lane
-
-assigned = set(lane_map)
-unassigned = sorted(set(all_sheets) - assigned)
-if unassigned:
-    st.warning(
-        f"{len(unassigned)} sheet(s) not yet assigned to any category "
-        f"(defaulting to Source data for rendering): {', '.join(unassigned[:20])}"
-        + (" ..." if len(unassigned) > 20 else "")
-    )
-    for s in unassigned:
-        lane_map[s] = "Source data"
+lane_map = dict(zip(st.session_state.lane_df["Sheet"], st.session_state.lane_df["Category"]))
 
 with st.expander("Lane summary"):
     for lane in LANES:
