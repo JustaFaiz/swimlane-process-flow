@@ -63,31 +63,38 @@ class RefEdge:
     link_type: str = "formula"  # "formula" | "named_range" | "value_match"
 
 
-def _numeric_id_key(val) -> Optional[str]:
-    """Canonical digit-only string for a cell value, or None if it doesn't
-    qualify as a matchable 'ID-like' value. Deliberately narrow: whole
-    numbers/digit-strings of length >= 5 only — this is meant to catch
-    account codes, transaction/reference IDs, GL codes and the like (the
-    things that genuinely get copy-pasted identically between a source
-    extract and a workpaper), not dollar amounts (decimals are excluded)
-    or coincidental small numbers."""
+def _numeric_id_key(val) -> Optional[Tuple[str, str, bool]]:
+    """(rounded_key, display_value, was_exact) for a cell value, or None if
+    it doesn't qualify as a matchable 'ID-like' value.
+
+    Decimals are now rounded to the nearest whole number rather than
+    excluded — a precise formula-computed figure in one sheet (4180872.53)
+    and a rounded pasted figure in another (4,180,873) represent the same
+    underlying number and should match. was_exact is False only when
+    rounding actually discarded information (a genuine decimal), so a
+    comma-formatted whole number like "4,180,873" is still exact — the
+    edge detail can then say 'rounds A & B' only when real rounding
+    happened, not just a formatting difference. Still whole-number-length
+    >= 5 only (checked by the caller against the rounded digit count) — the
+    point is account codes / transaction IDs / reconciling figures, not
+    tiny coincidental numbers."""
     if isinstance(val, bool):
         return None
     if isinstance(val, (datetime.date, datetime.datetime, datetime.time)):
         return None
     if isinstance(val, int):
-        s = str(val)
+        n, display, exact = val, str(val), True
     elif isinstance(val, float):
-        if not val.is_integer():
-            return None
-        s = str(int(val))
+        n, display, exact = round(val), str(val), val.is_integer()
     elif isinstance(val, str):
-        s = val.strip()
-        if not s.isdigit():
+        s = val.strip().replace(",", "")
+        if not re.fullmatch(r"-?\d+(\.\d+)?", s):
             return None
+        f = float(s)
+        n, display, exact = round(f), val.strip(), f.is_integer()
     else:
         return None
-    return s if len(s) >= 5 else None
+    return str(n), display, exact
 
 
 def _resolve_defined_names(wb) -> Dict[str, Tuple[str, str]]:
@@ -208,15 +215,19 @@ def extract_cross_sheet_refs(
                                         )
                                     )
                     elif match_values:
-                        key = _numeric_id_key(val)
-                        if key is not None and len(key) >= min_value_length:
-                            value_index[key].append(
-                                (sheet_position[tgt_sheet], tgt_sheet, f"{get_column_letter(col_idx)}{row_idx}")
-                            )
+                        result = _numeric_id_key(val)
+                        if result is not None:
+                            key, display, exact = result
+                            digit_count = len(key.lstrip("-"))
+                            if digit_count >= min_value_length:
+                                value_index[key].append(
+                                    (sheet_position[tgt_sheet], tgt_sheet,
+                                     f"{get_column_letter(col_idx)}{row_idx}", display, exact)
+                                )
 
         if match_values:
             for key, occurrences in value_index.items():
-                distinct_sheets = {sheet for _, sheet, _ in occurrences}
+                distinct_sheets = {sheet for _, sheet, _, _, _ in occurrences}
                 if len(distinct_sheets) < 2:
                     continue  # only appears in one sheet — not a cross-sheet link
                 if len(distinct_sheets) > max_value_sheet_spread or len(occurrences) > max_value_occurrences:
@@ -227,21 +238,25 @@ def extract_cross_sheet_refs(
                 # value legitimately appears in several sheets
                 seen_pairs = set()
                 for i in range(len(occurrences) - 1):
-                    _, src_sheet, src_cell = occurrences[i]
-                    _, tgt_sheet, tgt_cell = occurrences[i + 1]
+                    _, src_sheet, src_cell, src_display, src_exact = occurrences[i]
+                    _, tgt_sheet, tgt_cell, tgt_display, tgt_exact = occurrences[i + 1]
                     if src_sheet == tgt_sheet:
                         continue
                     pair = (src_sheet, tgt_sheet)
                     if pair in seen_pairs:
                         continue
                     seen_pairs.add(pair)
+                    if src_exact and tgt_exact:
+                        note = f"[matched value {key}]"
+                    else:
+                        note = f"[matched value ~{key} \u2014 rounds {src_display} & {tgt_display}]"
                     edges.append(
                         RefEdge(
                             src_sheet=src_sheet,
                             src_ref=src_cell,
                             tgt_sheet=tgt_sheet,
                             tgt_cell=tgt_cell,
-                            formula=f"[matched value {key}]",
+                            formula=note,
                             link_type="value_match",
                         )
                     )
