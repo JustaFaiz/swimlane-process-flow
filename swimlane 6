@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import io
 import json
 import re
 import sys
@@ -512,6 +513,82 @@ def full_flow_subgraph(G: nx.DiGraph, node: str) -> nx.DiGraph:
     return G.subgraph(nodes).copy()
 
 
+def edges_for_subgraph(edges: List[RefEdge], G: nx.DiGraph) -> List[RefEdge]:
+    """Filter the full cell-level edge list down to just the links between
+    sheets that are actually present in `G` — the raw-edge equivalent of
+    whichever subgraph is being rendered (full workbook, one traced flow,
+    immediate neighbors, etc), used to drive the node click-detail panel
+    and the XLSX export so they match what's on screen."""
+    nodes = set(G.nodes())
+    return [e for e in edges if e.src_sheet in nodes and e.tgt_sheet in nodes]
+
+
+def _node_click_data(G: nx.DiGraph, lanes: Dict[str, str], raw_edges: List[RefEdge], max_samples: int = 8) -> dict:
+    """Per-node breakdown of every incoming/outgoing connection, grouped by
+    (other sheet, link type), for the interactive diagram's click-to-inspect
+    panel. link type is 'formula', 'named_range', or 'value_match', matching
+    RefEdge.link_type, so the panel can show exactly what kind of connection
+    it is and the specific cells/formula/value behind it — not just a count."""
+    incoming: Dict[str, Dict[Tuple[str, str], list]] = defaultdict(lambda: defaultdict(list))
+    outgoing: Dict[str, Dict[Tuple[str, str], list]] = defaultdict(lambda: defaultdict(list))
+
+    for e in raw_edges:
+        if e.link_type == "value_match":
+            label = f"matched value: {e.src_sheet}!{e.src_ref} \u2192 {e.tgt_sheet}!{e.tgt_cell}"
+        elif e.link_type == "named_range":
+            label = f"{e.src_sheet}!{e.src_ref} \u2192 {e.tgt_sheet}!{e.tgt_cell}  ({e.formula})"
+        else:
+            label = f"{e.src_sheet}!{e.src_ref} \u2192 {e.tgt_sheet}!{e.tgt_cell}  ({e.formula})"
+        outgoing[e.src_sheet][(e.tgt_sheet, e.link_type)].append(label)
+        incoming[e.tgt_sheet][(e.src_sheet, e.link_type)].append(label)
+
+    def _entries(grouped: Dict[Tuple[str, str], list]) -> list:
+        items = [
+            {"sheet": other, "type": ltype, "count": len(samples), "samples": samples[:max_samples]}
+            for (other, ltype), samples in grouped.items()
+        ]
+        items.sort(key=lambda it: (-it["count"], it["sheet"]))
+        return items
+
+    return {
+        node: {
+            "lane": lanes.get(node, ""),
+            "incoming": _entries(incoming.get(node, {})),
+            "outgoing": _entries(outgoing.get(node, {})),
+        }
+        for node in G.nodes()
+    }
+
+
+def export_flow_xlsx(G: nx.DiGraph, lanes: Dict[str, str], raw_edges: List[RefEdge]) -> bytes:
+    """Build a small .xlsx workbook capturing exactly what's in a rendered
+    diagram — a 'Sheets' tab (sheet + category) and a 'Connections' tab
+    (every underlying cell-level link, with its type), so the diagram's
+    data can be reviewed, filtered, or pivoted in Excel itself rather than
+    only viewed as a picture."""
+    out_wb = openpyxl.Workbook()
+
+    ws1 = out_wb.active
+    ws1.title = "Sheets"
+    ws1.append(["Sheet", "Category"])
+    for node in sorted(G.nodes()):
+        ws1.append([node, lanes.get(node, "")])
+
+    ws2 = out_wb.create_sheet("Connections")
+    ws2.append(["Source Sheet", "Source Ref", "Target Sheet", "Target Cell", "Link Type", "Formula / Detail"])
+    for e in raw_edges:
+        ws2.append([e.src_sheet, e.src_ref, e.tgt_sheet, e.tgt_cell, e.link_type, e.formula])
+
+    for ws in (ws1, ws2):
+        for col_cells in ws.columns:
+            length = max((len(str(c.value)) for c in col_cells if c.value is not None), default=10)
+            ws.column_dimensions[col_cells[0].column_letter].width = min(max(length + 2, 10), 60)
+
+    buf = io.BytesIO()
+    out_wb.save(buf)
+    return buf.getvalue()
+
+
 def suggest_lane(in_degree: int, out_degree: int) -> str:
     """Everything defaults to Calculations — Input and Output are sheets the
     person deliberately picks out themselves (they said as much), so this
@@ -616,28 +693,18 @@ def swimlane_figure(
         for u, v, data in G.edges(data=True):
             x1, y1 = xy[u]
             x2, y2 = xy[v]
-            is_inferred = data.get("value_match_only", False)
             arrow = FancyArrowPatch(
                 (x1, y1), (x2, y2),
                 connectionstyle="arc3,rad=0.15",
                 arrowstyle="-|>", mutation_scale=14,
-                color="#8a6d3b" if is_inferred else "#555555",
-                linewidth=1 + min(data.get("weight", 1) / 5, 3),
-                linestyle=(0, (4, 3)) if is_inferred else "solid",
+                color="#555555", linewidth=1 + min(data.get("weight", 1) / 5, 3),
                 zorder=1, shrinkA=28, shrinkB=28,
             )
             ax.add_patch(arrow)
             mx, my = (x1 + x2) / 2, (y1 + y2) / 2
-            label = ("~" if is_inferred else "") + str(data.get("weight", ""))
-            ax.text(mx, my, label, fontsize=8, color="#333",
+            ax.text(mx, my, f"~{data.get('weight', '')}", fontsize=8, color="#333",
                     ha="center", va="center",
                     bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.8))
-
-        if any(d.get("value_match_only") for _, _, d in G.edges(data=True)):
-            ax.text(
-                0.5, 1.01, "dashed/\u007e = inferred from a matching value, not a formula",
-                transform=ax.transAxes, ha="center", va="bottom", fontsize=9, color="#8a6d3b",
-            )
 
     # draw sheet nodes
     for node, (x, y) in xy.items():
@@ -691,10 +758,17 @@ def swimlane_html_string(
     lane_order: Optional[List[str]] = None,
     title: str = "Workbook Process Flow (Swimlane)",
     dense_edge_threshold: int = 300,
+    raw_edges: Optional[List[RefEdge]] = None,
 ) -> str:
     """Build the self-contained interactive HTML (pan/zoom SVG) and return
     it as a string — the form used by Streamlit via st.components.v1.html(),
-    or written straight to a file and opened in a browser tab."""
+    or written straight to a file and opened in a browser tab.
+
+    If raw_edges is given (the cell-level RefEdge list, filtered to this
+    subgraph via edges_for_subgraph), clicking a node opens a side panel
+    showing every incoming/outgoing connection for that sheet, grouped by
+    the other sheet and by link type (formula / named range / value match),
+    with the underlying cell references. Without it, nodes are click-inert."""
     import html as html_mod
 
     if lane_order is None:
@@ -761,23 +835,17 @@ def swimlane_html_string(
             x2, y2 = xy[v]
             weight = data.get("weight", 1)
             detail = data.get("detail", [])
-            is_inferred = data.get("value_match_only", False)
             tooltip = esc("\n".join(detail)) if detail else esc(f"{u} -> {v} ({weight})")
-            if is_inferred:
-                tooltip = esc("inferred from a matching value, not a formula\n") + tooltip
             lw = 1 + min(weight / 5, 3)
-            stroke = "#8a6d3b" if is_inferred else "#555"
-            dash = ' stroke-dasharray="6,4"' if is_inferred else ""
             mx, my = (x1 + x2) / 2, (y1 + y2) / 2
-            label = ("~" if is_inferred else "") + str(weight)
             svg_parts.append(
                 f'<g class="edge">'
-                f'<path d="M {x1:.1f} {y1:.1f} L {x2:.1f} {y2:.1f}" stroke="{stroke}" '
-                f'stroke-width="{lw:.1f}" fill="none" marker-end="url(#arrow)"{dash}/>'
+                f'<path d="M {x1:.1f} {y1:.1f} L {x2:.1f} {y2:.1f}" stroke="#555" '
+                f'stroke-width="{lw:.1f}" fill="none" marker-end="url(#arrow)"/>'
                 f'<title>{tooltip}</title>'
                 f'<circle cx="{mx:.1f}" cy="{my:.1f}" r="9" fill="white" opacity="0.85"/>'
                 f'<text x="{mx:.1f}" y="{my:.1f}" font-size="10" text-anchor="middle" '
-                f'dominant-baseline="middle" fill="#333">{label}</text>'
+                f'dominant-baseline="middle" fill="#333">~{weight}</text>'
                 f'</g>'
             )
 
@@ -787,16 +855,19 @@ def swimlane_html_string(
         li = lane_order.index(lane) if lane in lane_order else len(lane_order) - 1
         color = lane_color(lane, li)
         svg_parts.append(
-            f'<g class="node">'
+            f'<g class="node" data-node="{esc(node)}">'
             f'<rect x="{x - node_w / 2:.1f}" y="{y - node_h / 2:.1f}" width="{node_w}" height="{node_h}" '
             f'rx="8" fill="white" stroke="#333" stroke-width="1.4"/>'
             f'<text x="{x:.1f}" y="{y:.1f}" font-size="12" text-anchor="middle" '
             f'dominant-baseline="middle">{esc(node)}</text>'
-            f'<title>{esc(node)} — {esc(lane)}</title>'
+            f'<title>{esc(node)} — {esc(lane)} (click for details)</title>'
             f'</g>'
         )
 
     svg_body = "\n".join(svg_parts)
+
+    node_data = _node_click_data(G, lanes, raw_edges) if raw_edges is not None else {}
+    node_data_json = json.dumps(node_data)
 
     html = f"""<!DOCTYPE html>
 <html>
@@ -813,16 +884,43 @@ def swimlane_html_string(
   #header button:hover {{ background: #45456a; }}
   #stage {{ width: 100%; height: calc(100vh - 50px); cursor: grab; overflow: hidden; }}
   #stage:active {{ cursor: grabbing; }}
+  .node {{ cursor: pointer; }}
   .node rect {{ transition: stroke 0.1s; }}
   .node:hover rect {{ stroke: #1a1a2e; stroke-width: 2.4; }}
   .edge:hover path {{ stroke: #1a1a2e; }}
+
+  #panel {{
+    position: fixed; top: 0; right: 0; width: 360px; height: 100%; background: white;
+    box-shadow: -2px 0 12px rgba(0,0,0,0.2); transform: translateX(100%);
+    transition: transform 0.18s ease-out; overflow-y: auto; z-index: 10;
+  }}
+  #panel.open {{ transform: translateX(0); }}
+  #panel-header {{
+    position: sticky; top: 0; background: #1a1a2e; color: white; padding: 14px 16px;
+    display: flex; justify-content: space-between; align-items: center;
+  }}
+  #panel-header h3 {{ margin: 0; font-size: 15px; word-break: break-word; padding-right: 8px; }}
+  #panel-close {{ background: none; border: none; color: #aaa; font-size: 20px; cursor: pointer; line-height: 1; }}
+  #panel-close:hover {{ color: white; }}
+  #panel-body {{ padding: 14px 16px; }}
+  #panel-body h4 {{ font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; color: #888; margin: 18px 0 8px; }}
+  #panel-body h4:first-child {{ margin-top: 0; }}
+  .empty {{ color: #999; font-size: 13px; font-style: italic; }}
+  .conn {{ border: 1px solid #e5e5e5; border-radius: 6px; padding: 8px 10px; margin-bottom: 8px; }}
+  .conn-head {{ display: flex; align-items: center; gap: 6px; font-size: 13px; flex-wrap: wrap; }}
+  .badge {{ color: white; font-size: 10px; padding: 2px 7px; border-radius: 10px; white-space: nowrap; }}
+  .count {{ color: #888; font-size: 12px; }}
+  .samples {{ margin-top: 6px; }}
+  .sample {{ font-size: 11px; font-family: Consolas, Menlo, monospace; color: #555;
+             background: #f7f7f9; border-radius: 4px; padding: 4px 6px; margin-top: 3px;
+             word-break: break-all; }}
 </style>
 </head>
 <body>
 <div id="header">
   <h2>{esc(title)}</h2>
   <div>
-    <span style="font-size:12px;color:#aaa;margin-right:12px;">scroll to zoom · drag to pan</span>
+    <span style="font-size:12px;color:#aaa;margin-right:12px;">scroll to zoom · drag to pan · click a sheet for details</span>
     <button id="reset-btn">Reset view</button>
   </div>
 </div>
@@ -836,12 +934,24 @@ def swimlane_html_string(
 {svg_body}
   </g>
 </svg>
+<div id="panel">
+  <div id="panel-header">
+    <h3 id="panel-title"></h3>
+    <button id="panel-close">\u00d7</button>
+  </div>
+  <div id="panel-body"></div>
+</div>
 <script>
 (function() {{
+  var NODE_DATA = {node_data_json};
+
   var svg = document.getElementById('stage');
   var viewport = document.getElementById('viewport');
+  var panel = document.getElementById('panel');
+  var panelTitle = document.getElementById('panel-title');
+  var panelBody = document.getElementById('panel-body');
   var scale = 1, tx = 0, ty = 0;
-  var panning = false, startX = 0, startY = 0;
+  var panning = false, startX = 0, startY = 0, downX = 0, downY = 0, moved = false;
 
   function apply() {{
     viewport.setAttribute('transform', 'translate(' + tx + ',' + ty + ') scale(' + scale + ')');
@@ -861,17 +971,76 @@ def swimlane_html_string(
 
   svg.addEventListener('mousedown', function(e) {{
     panning = true; startX = e.clientX - tx; startY = e.clientY - ty;
+    downX = e.clientX; downY = e.clientY; moved = false;
   }});
   window.addEventListener('mousemove', function(e) {{
     if (!panning) return;
+    if (Math.abs(e.clientX - downX) > 4 || Math.abs(e.clientY - downY) > 4) moved = true;
     tx = e.clientX - startX; ty = e.clientY - startY;
     apply();
   }});
-  window.addEventListener('mouseup', function() {{ panning = false; }});
+  window.addEventListener('mouseup', function(e) {{
+    if (panning && !moved) {{
+      var nodeEl = e.target.closest ? e.target.closest('.node') : null;
+      if (nodeEl) {{
+        showPanel(nodeEl.getAttribute('data-node'));
+      }} else {{
+        hidePanel();
+      }}
+    }}
+    panning = false;
+  }});
 
   document.getElementById('reset-btn').addEventListener('click', function() {{
     scale = 1; tx = 0; ty = 0; apply();
   }});
+  document.getElementById('panel-close').addEventListener('click', hidePanel);
+
+  function escapeHtml(s) {{
+    var d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+  }}
+
+  function typeLabel(t) {{
+    if (t === 'formula') return 'formula';
+    if (t === 'named_range') return 'named range';
+    if (t === 'value_match') return 'value match';
+    return t;
+  }}
+  function typeColor(t) {{
+    if (t === 'value_match') return '#8a6d3b';
+    if (t === 'named_range') return '#2b6cb0';
+    return '#555555';
+  }}
+
+  function renderConnections(items) {{
+    if (!items.length) return '<div class="empty">none</div>';
+    return items.map(function(it) {{
+      var samplesHtml = it.samples.map(function(s) {{
+        return '<div class="sample">' + escapeHtml(s) + '</div>';
+      }}).join('');
+      return '<div class="conn">' +
+        '<div class="conn-head">' +
+          '<span class="badge" style="background:' + typeColor(it.type) + '">' + typeLabel(it.type) + '</span>' +
+          '<b>' + escapeHtml(it.sheet) + '</b>' +
+          '<span class="count">(' + it.count + ')</span>' +
+        '</div>' +
+        '<div class="samples">' + samplesHtml + '</div>' +
+      '</div>';
+    }}).join('');
+  }}
+
+  function showPanel(name) {{
+    var data = NODE_DATA[name];
+    if (!data) return;
+    panelTitle.textContent = name;
+    panelBody.innerHTML =
+      '<h4>Incoming (' + data.incoming.length + ')</h4>' + renderConnections(data.incoming) +
+      '<h4>Outgoing (' + data.outgoing.length + ')</h4>' + renderConnections(data.outgoing);
+    panel.classList.add('open');
+  }}
+  function hidePanel() {{ panel.classList.remove('open'); }}
 
   apply();
 }})();
