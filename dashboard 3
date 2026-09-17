@@ -1,0 +1,773 @@
+"""
+Swimlane_Flow.py
+
+Builds a swimlane process-flow diagram from an Excel workbook by tracing
+cross-sheet formula references (cell-level lineage -> sheet-level graph).
+
+Pipeline:
+    1. extract_cross_sheet_refs()  -> raw cell-to-cell edges from formulas
+    2. build_sheet_graph()         -> aggregated sheet-to-sheet DiGraph
+    3. classify_lanes()            -> assigns each sheet to Input/Process/Output
+                                       (or user-supplied lanes)
+    4. render_swimlane()           -> static PNG (matplotlib, no external deps)
+    5. render_swimlane_html()      -> interactive HTML (vis-network via CDN)
+
+Usage (CLI):
+    python Swimlane_Flow.py workbook.xlsx --out swimlane.png
+    python Swimlane_Flow.py workbook.xlsx --out swimlane.html --html
+    python Swimlane_Flow.py workbook.xlsx --out swimlane.png \
+        --lanes "Input:RawData,Assumptions" "Process:Calc,Adj" "Output:Summary"
+
+As a library:
+    from Swimlane_Flow import build_pipeline
+    edges, G, lanes = build_pipeline("workbook.xlsx")
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import networkx as nx
+import openpyxl
+from openpyxl.utils import get_column_letter
+
+
+# ---------------------------------------------------------------------------
+# 1. Formula parsing / cross-sheet reference extraction
+# ---------------------------------------------------------------------------
+
+# Matches: SheetName!A1   |  'Sheet Name'!A1:B10   |  'Sheet''s'!$A$1
+_SHEET_REF = re.compile(
+    r"(?:'((?:[^']|'')+)'|([A-Za-z_][A-Za-z0-9_.]*))"   # sheet name (quoted or bare)
+    r"!"
+    r"(\$?[A-Z]{1,3}\$?[0-9]+(?::\$?[A-Z]{1,3}\$?[0-9]+)?)"  # cell or range
+)
+
+
+@dataclass
+class RefEdge:
+    src_sheet: str
+    src_ref: str
+    tgt_sheet: str
+    tgt_cell: str
+    formula: str
+
+
+def extract_cross_sheet_refs(workbook_path: str) -> List[RefEdge]:
+    """Scan every formula cell in the workbook and pull out any references
+    that point at a *different* sheet than the one the formula lives in.
+
+    Returns a flat list of RefEdge(src_sheet, src_ref, tgt_sheet, tgt_cell, formula)
+    where the direction is: src_sheet feeds INTO tgt_sheet (data flows from the
+    referenced sheet to the sheet holding the formula).
+
+    Loads in read_only + values_only mode: openpyxl's default mode builds a
+    full Cell object (with style info) for every cell in the workbook, which
+    on a large multi-sheet, heavily-formatted file (the norm for tax
+    workpapers) is the dominant cost — on a ~1.45M-cell benchmark workbook
+    this cut total scan time from ~11s to ~6.5s. Cell coordinates are
+    rebuilt from row/column indices since values_only mode skips Cell
+    objects entirely.
+    """
+    wb = openpyxl.load_workbook(workbook_path, data_only=False, read_only=True)
+    edges: List[RefEdge] = []
+
+    try:
+        for ws in wb.worksheets:
+            tgt_sheet = ws.title
+            for row_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
+                for col_idx, val in enumerate(row, start=1):
+                    if not isinstance(val, str) or not val or val[0] != "=":
+                        continue
+
+                    for m in _SHEET_REF.finditer(val):
+                        raw_sheet = (m.group(1) or m.group(2) or "").replace("''", "'")
+                        src_ref = m.group(3)
+                        if raw_sheet and raw_sheet != tgt_sheet:
+                            edges.append(
+                                RefEdge(
+                                    src_sheet=raw_sheet,
+                                    src_ref=src_ref,
+                                    tgt_sheet=tgt_sheet,
+                                    tgt_cell=f"{get_column_letter(col_idx)}{row_idx}",
+                                    formula=val,
+                                )
+                            )
+    finally:
+        wb.close()
+    return edges
+
+
+# ---------------------------------------------------------------------------
+# 2. Aggregate to a sheet-level DiGraph
+# ---------------------------------------------------------------------------
+
+def build_sheet_graph(edges: List[RefEdge]) -> nx.DiGraph:
+    """Collapse cell-level RefEdges into a sheet-to-sheet DiGraph.
+    Edge weight = number of formula links between the two sheets.
+    Edge attr 'detail' = list of (src_ref, tgt_cell, formula) samples (capped).
+    """
+    G = nx.DiGraph()
+    counts: Dict[Tuple[str, str], int] = defaultdict(int)
+    detail: Dict[Tuple[str, str], list] = defaultdict(list)
+
+    for e in edges:
+        key = (e.src_sheet, e.tgt_sheet)
+        counts[key] += 1
+        if len(detail[key]) < 8:  # cap sample detail per edge
+            detail[key].append(f"{e.src_sheet}!{e.src_ref} -> {e.tgt_sheet}!{e.tgt_cell}")
+        G.add_node(e.src_sheet)
+        G.add_node(e.tgt_sheet)
+
+    for (src, tgt), n in counts.items():
+        G.add_edge(src, tgt, weight=n, detail=detail[(src, tgt)])
+
+    return G
+
+
+def build_cell_graph(edges: List[RefEdge]) -> nx.DiGraph:
+    """Cell-level DiGraph — nodes are 'Sheet!Ref' strings (a single cell or,
+    for range references, the whole range as one node), edges are the exact
+    formula links from RefEdge. This is the precise version of the lineage;
+    build_sheet_graph collapses it down to one node per sheet, which is what
+    makes a whole-sheet ancestor/descendant trace pull in sheets that share
+    no real data path with the sheet you're tracing — just a coincidental
+    connection through an unrelated cell elsewhere in the same intermediate
+    sheet. Tracing at this cell level and then reading off which sheets the
+    resulting node set touches avoids that."""
+    G = nx.DiGraph()
+    for e in edges:
+        src_node = f"{e.src_sheet}!{e.src_ref}"
+        tgt_node = f"{e.tgt_sheet}!{e.tgt_cell}"
+        G.add_edge(src_node, tgt_node)
+    return G
+
+
+def relevant_flow_sheets(edges: List[RefEdge], drill_sheet: str) -> set:
+    """The precise set of sheets that actually sit on a real data path
+    through `drill_sheet` — as opposed to every sheet reachable at the
+    whole-sheet level, which overcounts whenever an intermediate sheet has
+    other, unrelated cross-sheet formulas of its own.
+
+    Traces at the cell level: ancestors of the specific cells in
+    `drill_sheet` that pull from elsewhere, plus descendants of the specific
+    cells in `drill_sheet` that other sheets pull from — not every sheet
+    the whole intermediate sheet happens to touch."""
+    cell_G = build_cell_graph(edges)
+
+    def sheet_of(node: str) -> str:
+        return node.split("!", 1)[0]
+
+    seed_nodes = {n for n in cell_G.nodes if sheet_of(n) == drill_sheet and cell_G.in_degree(n) > 0}
+    exit_nodes = {n for n in cell_G.nodes if sheet_of(n) == drill_sheet and cell_G.out_degree(n) > 0}
+
+    relevant_nodes = set(seed_nodes) | set(exit_nodes)
+    for n in seed_nodes:
+        relevant_nodes |= nx.ancestors(cell_G, n)
+    for n in exit_nodes:
+        relevant_nodes |= nx.descendants(cell_G, n)
+
+    return {sheet_of(n) for n in relevant_nodes} | {drill_sheet}
+
+
+def relevant_flow_subgraph(G: nx.DiGraph, edges: List[RefEdge], drill_sheet: str) -> nx.DiGraph:
+    """The sheet-level subgraph restricted to sheets that sit on an actual
+    cell-level data path through `drill_sheet` — the noise-filtered version
+    of full_flow_subgraph. Reuses the existing sheet-level graph's edges
+    (weights/detail already computed there) for whichever sheets survive
+    the cell-level filter."""
+    if drill_sheet not in G:
+        return G.subgraph([]).copy()
+    keep = relevant_flow_sheets(edges, drill_sheet) & set(G.nodes)
+    return G.subgraph(keep).copy()
+
+
+# ---------------------------------------------------------------------------
+# 3. Lane classification
+# ---------------------------------------------------------------------------
+
+def classify_lanes(
+    G: nx.DiGraph,
+    overrides: Optional[Dict[str, str]] = None,
+) -> Dict[str, str]:
+    """Assign each sheet to a lane: Input / Process / Output.
+
+    Heuristic:
+      - no incoming cross-sheet refs, has outgoing  -> Input
+      - no outgoing cross-sheet refs, has incoming   -> Output
+      - both incoming and outgoing                   -> Process
+      - isolated node (no refs either way)            -> Process (unclassified)
+
+    `overrides` lets you force specific sheets into a lane, e.g.
+      {"RawData": "Input", "Summary": "Output"}
+    """
+    lanes: Dict[str, str] = {}
+    for node in G.nodes:
+        indeg = G.in_degree(node)
+        outdeg = G.out_degree(node)
+        if indeg == 0 and outdeg > 0:
+            lanes[node] = "Input"
+        elif outdeg == 0 and indeg > 0:
+            lanes[node] = "Output"
+        else:
+            lanes[node] = "Process"
+
+    if overrides:
+        lanes.update(overrides)
+
+    return lanes
+
+
+def parse_lane_overrides(lane_args: Optional[List[str]]) -> Dict[str, str]:
+    """Parse CLI --lanes "Input:Sheet1,Sheet2" "Output:Sheet3" into overrides dict."""
+    overrides: Dict[str, str] = {}
+    if not lane_args:
+        return overrides
+    for spec in lane_args:
+        lane_name, _, sheets = spec.partition(":")
+        for s in sheets.split(","):
+            s = s.strip()
+            if s:
+                overrides[s] = lane_name.strip()
+    return overrides
+
+
+# ---------------------------------------------------------------------------
+# 4. Layout: x = topological depth, y = lane index
+# ---------------------------------------------------------------------------
+
+def _break_cycles_for_layout(G: nx.DiGraph) -> nx.DiGraph:
+    """Return an acyclic copy for layout purposes only (drops back-edges).
+    The original graph (with cycles intact) is what gets rendered/exported;
+    this copy is only used to compute x-positions."""
+    H = G.copy()
+    try:
+        while True:
+            cycle = nx.find_cycle(H)
+            H.remove_edge(*cycle[0][:2])
+    except nx.NetworkXNoCycle:
+        pass
+    return H
+
+
+def compute_positions(G: nx.DiGraph, lanes: Dict[str, str], lane_order: List[str]):
+    """x = longest-path depth from any source (acyclic view).
+    Also returns lane_capacity: the busiest single depth-column within each
+    lane — i.e. how many sheets are ever stacked at the same (lane, depth)
+    cell. The renderers use this to size each band tall enough to hold its
+    most crowded column, so nodes can never spill into a neighboring lane
+    (the bug that made large workbooks render outside their swimlane)."""
+    H = _break_cycles_for_layout(G)
+    depth = {n: 0 for n in H.nodes}
+    for n in nx.topological_sort(H):
+        for succ in H.successors(n):
+            depth[succ] = max(depth[succ], depth[n] + 1)
+
+    lane_index = {name: i for i, name in enumerate(lane_order)}
+    pos = {}
+    seen_slots: Dict[Tuple[int, int], int] = defaultdict(int)
+    for node in G.nodes:
+        lane = lanes.get(node, lane_order[-1] if lane_order else "Process")
+        li = lane_index.get(lane, len(lane_order) - 1)
+        d = depth.get(node, 0)
+        slot = seen_slots[(li, d)]
+        seen_slots[(li, d)] += 1
+        pos[node] = (d, li, slot)
+
+    cell_counts: Dict[Tuple[int, int], int] = defaultdict(int)
+    for (li, d), n in seen_slots.items():
+        cell_counts[(li, d)] = max(cell_counts[(li, d)], n)
+    lane_capacity = {lane: 1 for lane in lane_order}
+    for (li, d), n in cell_counts.items():
+        lane = lane_order[li] if 0 <= li < len(lane_order) else lane_order[-1]
+        lane_capacity[lane] = max(lane_capacity[lane], n)
+
+    return pos, lane_capacity
+
+
+def _lane_bands(lane_order: List[str], lane_capacity: Dict[str, int], node_spacing: float, padding: float):
+    """Stack lanes top-to-bottom (lane_order[0] highest) with each band's
+    height derived from how many nodes it actually needs to hold, and return
+    each lane's (bottom, height) plus the total diagram height."""
+    bottoms: Dict[str, float] = {}
+    heights: Dict[str, float] = {}
+    y = 0.0
+    for lane in reversed(lane_order):
+        cap = max(lane_capacity.get(lane, 1), 1)
+        h = cap * node_spacing + padding
+        bottoms[lane] = y
+        heights[lane] = h
+        y += h
+    return bottoms, heights, y
+
+
+# ---------------------------------------------------------------------------
+# Shared lane palette (used by both the matplotlib and HTML renderers)
+# ---------------------------------------------------------------------------
+
+LANE_COLORS = {
+    # generic 3-lane defaults (CLI / library default)
+    "Input": "#cfe8ff",
+    "Process": "#fff3cf",
+    "Output": "#d7f7d1",
+    # tax-process 5-lane set used by the Streamlit dashboard
+    "Source data": "#cfe8ff",
+    "Tax adjustments": "#ffe3b3",
+    "CT entries": "#fff3cf",
+    "Consolidation": "#e6d7f7",
+}
+_FALLBACK_COLORS = ["#e6d7f7", "#ffd9d0", "#d0f0f7", "#f7d0e8"]
+
+
+def _default_lane_order(lanes: Dict[str, str]) -> List[str]:
+    default = ["Input", "Process", "Output"]
+    extra = sorted({l for l in lanes.values() if l not in default})
+    return default + extra
+
+
+def lane_color(lane: str, fallback_index: int = 0) -> str:
+    return LANE_COLORS.get(lane, _FALLBACK_COLORS[fallback_index % len(_FALLBACK_COLORS)])
+
+
+def ancestors_subgraph(G: nx.DiGraph, target: str) -> nx.DiGraph:
+    """Return the induced subgraph of `target` plus every sheet that feeds
+    into it (directly or transitively) — i.e. the single end-to-end flow
+    that produces `target`. Used for the 'trace this output' drill-down."""
+    if target not in G:
+        return G.subgraph([]).copy()
+    nodes = nx.ancestors(G, target) | {target}
+    return G.subgraph(nodes).copy()
+
+
+def full_flow_subgraph(G: nx.DiGraph, node: str) -> nx.DiGraph:
+    """Return the induced subgraph of `node` plus everything upstream of it
+    (all ancestors, transitively) AND everything downstream of it (all
+    descendants, transitively) — the complete input-to-output chain that
+    passes through this one sheet, as opposed to just its direct neighbors."""
+    if node not in G:
+        return G.subgraph([]).copy()
+    nodes = nx.ancestors(G, node) | nx.descendants(G, node) | {node}
+    return G.subgraph(nodes).copy()
+
+
+def suggest_lane(in_degree: int, out_degree: int) -> str:
+    """Cheap heuristic used only to pre-fill the Streamlit category pickers;
+    the person always has the final say on classification."""
+    if in_degree == 0 and out_degree > 0:
+        return "Source data"
+    if out_degree == 0 and in_degree > 0:
+        return "Output"
+    if in_degree == 0 and out_degree == 0:
+        return "Source data"
+    return "Tax adjustments"
+
+
+def list_sheet_names(workbook_path_or_buffer) -> List[str]:
+    """Fast sheet-name listing (read_only mode) — used to populate the
+    category picker before running the full formula scan."""
+    wb = openpyxl.load_workbook(workbook_path_or_buffer, read_only=True)
+    names = list(wb.sheetnames)
+    wb.close()
+    return names
+
+
+# ---------------------------------------------------------------------------
+# 5a. Static rendering with matplotlib (no external binaries required)
+# ---------------------------------------------------------------------------
+
+def swimlane_figure(
+    G: nx.DiGraph,
+    lanes: Dict[str, str],
+    lane_order: Optional[List[str]] = None,
+    title: str = "Workbook Process Flow (Swimlane)",
+    dense_edge_threshold: int = 300,
+):
+    """Build and return a matplotlib Figure (does not save to disk) —
+    the form used by the Streamlit dashboard via st.pyplot(fig).
+
+    Below dense_edge_threshold edges: curved arrows + per-edge weight labels
+    (readable detail — the normal case for a single traced flow).
+    At or above it: switches to a bulk LineCollection for all edges with no
+    per-edge labels. FancyArrowPatch curves + text bboxes are expensive per
+    edge — on a ~10k-edge full-workbook graph that path took ~40s to render;
+    LineCollection draws the same edge count in ~1s. The tradeoff is no
+    arrowheads/weight labels in that mode; use a per-output trace (far fewer
+    edges) when you need that level of detail."""
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import FancyBboxPatch
+    from matplotlib.patches import FancyArrowPatch
+    from matplotlib.collections import LineCollection
+
+    if lane_order is None:
+        lane_order = _default_lane_order(lanes)
+
+    pos, lane_capacity = compute_positions(G, lanes, lane_order)
+    max_depth = max((p[0] for p in pos.values()), default=0)
+
+    node_spacing, band_padding = 0.85, 0.9
+    bottoms, heights, total_height = _lane_bands(lane_order, lane_capacity, node_spacing, band_padding)
+
+    col_w = 2.6
+    raw_width = (max_depth + 1) * col_w + 2
+    # Safety cap: an unusually long dependency chain (rare, but possible with
+    # a formula chain running through many stages) shouldn't produce a
+    # runaway-width figure. Compress column spacing to stay under a sane
+    # width rather than growing unbounded.
+    max_fig_w = 90
+    if raw_width > max_fig_w:
+        col_w = (max_fig_w - 2) / (max_depth + 1)
+    fig_w = max(8, min(raw_width, max_fig_w))
+    fig_h = max(4, total_height)
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+    # lane background bands + labels (lane_order[0] at top, reading order top-down)
+    for i, lane in enumerate(lane_order):
+        y0 = bottoms[lane]
+        h = heights[lane]
+        color = lane_color(lane, i)
+        ax.axhspan(y0, y0 + h, color=color, alpha=0.35, zorder=0)
+        ax.text(
+            -1.3, y0 + h / 2, lane,
+            fontsize=13, fontweight="bold", va="center", ha="right",
+        )
+
+    # node coordinates — each node sits inside its own lane's band, top-aligned
+    # by slot, so no node can ever land in a neighboring lane regardless of
+    # how many sheets share that lane/depth.
+    xy = {}
+    for node, (d, li, slot) in pos.items():
+        lane = lane_order[li] if 0 <= li < len(lane_order) else lane_order[-1]
+        x = d * col_w
+        y = bottoms[lane] + band_padding / 2 + (slot + 0.5) * node_spacing
+        xy[node] = (x, y)
+
+    n_edges = G.number_of_edges()
+    dense_mode = n_edges >= dense_edge_threshold
+
+    if dense_mode:
+        segments = [(xy[u], xy[v]) for u, v in G.edges()]
+        lc = LineCollection(segments, colors="#666666", linewidths=0.5, alpha=0.35, zorder=1)
+        ax.add_collection(lc)
+        ax.text(
+            0.5, 1.01, f"{n_edges} links — simplified rendering (no arrowheads/labels) for speed",
+            transform=ax.transAxes, ha="center", va="bottom", fontsize=9, color="#888",
+        )
+    else:
+        for u, v, data in G.edges(data=True):
+            x1, y1 = xy[u]
+            x2, y2 = xy[v]
+            arrow = FancyArrowPatch(
+                (x1, y1), (x2, y2),
+                connectionstyle="arc3,rad=0.15",
+                arrowstyle="-|>", mutation_scale=14,
+                color="#555555", linewidth=1 + min(data.get("weight", 1) / 5, 3),
+                zorder=1, shrinkA=28, shrinkB=28,
+            )
+            ax.add_patch(arrow)
+            mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+            ax.text(mx, my, str(data.get("weight", "")), fontsize=8, color="#333",
+                    ha="center", va="center",
+                    bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.8))
+
+    # draw sheet nodes
+    for node, (x, y) in xy.items():
+        w, h = 2.0, 0.6
+        box = FancyBboxPatch(
+            (x - w / 2, y - h / 2), w, h,
+            boxstyle="round,pad=0.05,rounding_size=0.08",
+            linewidth=1.4, edgecolor="#333333", facecolor="white", zorder=2,
+        )
+        ax.add_patch(box)
+        ax.text(x, y, node, ha="center", va="center", fontsize=9.5, zorder=3)
+
+    ax.set_xlim(-3, (max_depth + 1) * col_w)
+    ax.set_ylim(0, total_height)
+    ax.axis("off")
+    ax.set_title(title, fontsize=15, fontweight="bold", pad=14)
+    plt.tight_layout()
+    return fig
+
+
+def render_swimlane(
+    G: nx.DiGraph,
+    lanes: Dict[str, str],
+    out_path: str,
+    lane_order: Optional[List[str]] = None,
+    title: str = "Workbook Process Flow (Swimlane)",
+):
+    """CLI/file convenience wrapper around swimlane_figure()."""
+    import matplotlib.pyplot as plt
+    fig = swimlane_figure(G, lanes, lane_order=lane_order, title=title)
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# 5b. Interactive rendering — plain SVG + ~40 lines of vanilla JS.
+# ---------------------------------------------------------------------------
+# No third-party library, no CDN, no separate asset file. Earlier versions
+# embedded vis-network (a 465KB minified JS library), which kept running
+# into real transfer problems in a copy-paste-through-GitHub workflow: one
+# giant unbroken line, then a 673KB base64 file, then 20 files still too
+# many to paste one at a time. The actual fix is not a smaller/cleverer way
+# to move that library — it's not needing it. Pan/zoom/hover is implemented
+# directly against native SVG + a handful of DOM event listeners, so the
+# whole diagram is exactly one self-contained HTML string with nothing else
+# to transfer, ever.
+
+def swimlane_html_string(
+    G: nx.DiGraph,
+    lanes: Dict[str, str],
+    lane_order: Optional[List[str]] = None,
+    title: str = "Workbook Process Flow (Swimlane)",
+    dense_edge_threshold: int = 300,
+) -> str:
+    """Build the self-contained interactive HTML (pan/zoom SVG) and return
+    it as a string — the form used by Streamlit via st.components.v1.html(),
+    or written straight to a file and opened in a browser tab."""
+    import html as html_mod
+
+    if lane_order is None:
+        lane_order = _default_lane_order(lanes)
+
+    pos, lane_capacity = compute_positions(G, lanes, lane_order)
+    max_depth = max((p[0] for p in pos.values()), default=0)
+
+    node_w, node_h = 170, 50
+    col_w = 220
+    node_spacing, band_padding = 60, 70
+    bottoms, heights, total_height = _lane_bands(lane_order, lane_capacity, node_spacing, band_padding)
+
+    def to_canvas_y(world_y: float) -> float:
+        return total_height - world_y
+
+    xy = {}
+    for node, (d, li, slot) in pos.items():
+        lane = lane_order[li] if 0 <= li < len(lane_order) else lane_order[-1]
+        world_y = bottoms[lane] + band_padding / 2 + (slot + 0.5) * node_spacing
+        xy[node] = (d * col_w, to_canvas_y(world_y))
+
+    x_min = -300
+    x_max = (max_depth + 1) * col_w + 120
+    y_min, y_max = 0.0, total_height
+    view_w, view_h = x_max - x_min, y_max - y_min
+
+    dense_mode = G.number_of_edges() >= dense_edge_threshold
+    esc = html_mod.escape
+
+    svg_parts: List[str] = []
+
+    # lane bands + labels
+    for i, lane in enumerate(lane_order):
+        top = to_canvas_y(bottoms[lane] + heights[lane])
+        bottom = to_canvas_y(bottoms[lane])
+        color = lane_color(lane, i)
+        svg_parts.append(
+            f'<rect x="{x_min}" y="{top:.1f}" width="{view_w:.1f}" height="{bottom - top:.1f}" '
+            f'fill="{color}" opacity="0.35"/>'
+        )
+        svg_parts.append(
+            f'<text x="{x_min + 14}" y="{(top + bottom) / 2:.1f}" font-size="15" '
+            f'font-weight="bold" fill="#333" dominant-baseline="middle">{esc(lane)}</text>'
+        )
+
+    # edges (drawn before nodes so they sit behind them)
+    if dense_mode:
+        svg_parts.append(
+            f'<text x="{(x_min + x_max) / 2:.0f}" y="{y_min - 10:.0f}" font-size="12" '
+            f'fill="#888" text-anchor="middle">{G.number_of_edges()} links — simplified '
+            f'rendering (no arrowheads/labels) for speed</text>'
+        )
+        for u, v in G.edges():
+            x1, y1 = xy[u]
+            x2, y2 = xy[v]
+            svg_parts.append(
+                f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" '
+                f'stroke="#666" stroke-width="0.6" opacity="0.35"/>'
+            )
+    else:
+        for u, v, data in G.edges(data=True):
+            x1, y1 = xy[u]
+            x2, y2 = xy[v]
+            weight = data.get("weight", 1)
+            detail = data.get("detail", [])
+            tooltip = esc("\n".join(detail)) if detail else esc(f"{u} -> {v} ({weight})")
+            lw = 1 + min(weight / 5, 3)
+            mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+            svg_parts.append(
+                f'<g class="edge">'
+                f'<path d="M {x1:.1f} {y1:.1f} L {x2:.1f} {y2:.1f}" stroke="#555" '
+                f'stroke-width="{lw:.1f}" fill="none" marker-end="url(#arrow)"/>'
+                f'<title>{tooltip}</title>'
+                f'<circle cx="{mx:.1f}" cy="{my:.1f}" r="9" fill="white" opacity="0.85"/>'
+                f'<text x="{mx:.1f}" y="{my:.1f}" font-size="10" text-anchor="middle" '
+                f'dominant-baseline="middle" fill="#333">{weight}</text>'
+                f'</g>'
+            )
+
+    # nodes (drawn last, on top)
+    for node, (x, y) in xy.items():
+        lane = lanes.get(node, lane_order[-1])
+        li = lane_order.index(lane) if lane in lane_order else len(lane_order) - 1
+        color = lane_color(lane, li)
+        svg_parts.append(
+            f'<g class="node">'
+            f'<rect x="{x - node_w / 2:.1f}" y="{y - node_h / 2:.1f}" width="{node_w}" height="{node_h}" '
+            f'rx="8" fill="white" stroke="#333" stroke-width="1.4"/>'
+            f'<text x="{x:.1f}" y="{y:.1f}" font-size="12" text-anchor="middle" '
+            f'dominant-baseline="middle">{esc(node)}</text>'
+            f'<title>{esc(node)} — {esc(lane)}</title>'
+            f'</g>'
+        )
+
+    svg_body = "\n".join(svg_parts)
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>{esc(title)}</title>
+<style>
+  html, body {{ margin: 0; height: 100%; font-family: -apple-system, Segoe UI, Arial, sans-serif; }}
+  #header {{ padding: 12px 20px; background: #1a1a2e; color: white; display: flex;
+             justify-content: space-between; align-items: center; }}
+  #header h2 {{ margin: 0; font-size: 16px; }}
+  #header button {{ background: #33334d; color: white; border: 1px solid #555; border-radius: 4px;
+                     padding: 6px 12px; font-size: 12px; cursor: pointer; }}
+  #header button:hover {{ background: #45456a; }}
+  #stage {{ width: 100%; height: calc(100vh - 50px); cursor: grab; overflow: hidden; }}
+  #stage:active {{ cursor: grabbing; }}
+  .node rect {{ transition: stroke 0.1s; }}
+  .node:hover rect {{ stroke: #1a1a2e; stroke-width: 2.4; }}
+  .edge:hover path {{ stroke: #1a1a2e; }}
+</style>
+</head>
+<body>
+<div id="header">
+  <h2>{esc(title)}</h2>
+  <div>
+    <span style="font-size:12px;color:#aaa;margin-right:12px;">scroll to zoom · drag to pan</span>
+    <button id="reset-btn">Reset view</button>
+  </div>
+</div>
+<svg id="stage" viewBox="{x_min} {y_min} {view_w:.1f} {view_h:.1f}" preserveAspectRatio="xMidYMid meet">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#555"/>
+    </marker>
+  </defs>
+  <g id="viewport">
+{svg_body}
+  </g>
+</svg>
+<script>
+(function() {{
+  var svg = document.getElementById('stage');
+  var viewport = document.getElementById('viewport');
+  var scale = 1, tx = 0, ty = 0;
+  var panning = false, startX = 0, startY = 0;
+
+  function apply() {{
+    viewport.setAttribute('transform', 'translate(' + tx + ',' + ty + ') scale(' + scale + ')');
+  }}
+
+  svg.addEventListener('wheel', function(e) {{
+    e.preventDefault();
+    var rect = svg.getBoundingClientRect();
+    var mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    var factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+    var newScale = Math.max(0.1, Math.min(8, scale * factor));
+    tx = mx - (mx - tx) * (newScale / scale);
+    ty = my - (my - ty) * (newScale / scale);
+    scale = newScale;
+    apply();
+  }}, {{ passive: false }});
+
+  svg.addEventListener('mousedown', function(e) {{
+    panning = true; startX = e.clientX - tx; startY = e.clientY - ty;
+  }});
+  window.addEventListener('mousemove', function(e) {{
+    if (!panning) return;
+    tx = e.clientX - startX; ty = e.clientY - startY;
+    apply();
+  }});
+  window.addEventListener('mouseup', function() {{ panning = false; }});
+
+  document.getElementById('reset-btn').addEventListener('click', function() {{
+    scale = 1; tx = 0; ty = 0; apply();
+  }});
+
+  apply();
+}})();
+</script>
+</body>
+</html>"""
+
+    return html
+
+
+def render_swimlane_html(
+    G: nx.DiGraph,
+    lanes: Dict[str, str],
+    out_path: str,
+    lane_order: Optional[List[str]] = None,
+    title: str = "Workbook Process Flow (Swimlane)",
+):
+    """CLI/file convenience wrapper around swimlane_html_string()."""
+    html = swimlane_html_string(G, lanes, lane_order=lane_order, title=title)
+    Path(out_path).write_text(html, encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Pipeline + CLI
+# ---------------------------------------------------------------------------
+
+def build_pipeline(workbook_path: str, lane_overrides: Optional[Dict[str, str]] = None):
+    edges = extract_cross_sheet_refs(workbook_path)
+    G = build_sheet_graph(edges)
+    lanes = classify_lanes(G, overrides=lane_overrides)
+    return edges, G, lanes
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Build a swimlane process-flow diagram from an Excel workbook.")
+    ap.add_argument("workbook", help="Path to .xlsx workbook")
+    ap.add_argument("--out", default="swimlane.png", help="Output file path (.png or .html)")
+    ap.add_argument("--html", action="store_true", help="Render interactive HTML instead of static PNG")
+    ap.add_argument(
+        "--lanes", nargs="*",
+        help='Manual lane overrides, e.g. --lanes "Input:Sheet1,Sheet2" "Output:Sheet3"',
+    )
+    ap.add_argument("--dump-edges", help="Optional path to dump raw cell-level edges as JSON")
+    args = ap.parse_args()
+
+    overrides = parse_lane_overrides(args.lanes)
+    edges, G, lanes = build_pipeline(args.workbook, overrides)
+
+    print(f"Found {len(edges)} cross-sheet formula references across {G.number_of_nodes()} sheets.")
+    for sheet, lane in sorted(lanes.items(), key=lambda x: x[1]):
+        print(f"  [{lane:8s}] {sheet}")
+
+    if args.dump_edges:
+        Path(args.dump_edges).write_text(
+            json.dumps([e.__dict__ for e in edges], indent=2), encoding="utf-8"
+        )
+
+    if args.html or args.out.endswith(".html"):
+        render_swimlane_html(G, lanes, args.out)
+    else:
+        render_swimlane(G, lanes, args.out)
+
+    print(f"Swimlane diagram written to {args.out}")
+
+
+if __name__ == "__main__":
+    main()
