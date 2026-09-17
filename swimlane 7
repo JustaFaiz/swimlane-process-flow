@@ -256,14 +256,20 @@ def extract_cross_sheet_refs(
 
 def build_sheet_graph(edges: List[RefEdge]) -> nx.DiGraph:
     """Collapse cell-level RefEdges into a sheet-to-sheet DiGraph.
-    Edge weight = number of formula links between the two sheets.
+    Edge weight = total links between the two sheets, across all types.
+    Edge attr 'value_count' = links that are inferred value matches.
+    Edge attr 'formula_count' = links that are real formulas (literal
+    Sheet!Cell or named-range) — kept separate from weight so a diagram
+    can show both ("~10/14" = 10 matched values, 14 formula links) rather
+    than one merged number that hides which portion is actually verified.
     Edge attr 'detail' = list of (src_ref, tgt_cell, formula) samples (capped).
     Edge attr 'value_match_only' = True if every link behind this edge is an
-    inferred value match rather than an actual formula — lets the renderer
-    flag it as less certain than a real formula dependency.
+    inferred value match rather than an actual formula.
     """
     G = nx.DiGraph()
     counts: Dict[Tuple[str, str], int] = defaultdict(int)
+    value_counts: Dict[Tuple[str, str], int] = defaultdict(int)
+    formula_counts: Dict[Tuple[str, str], int] = defaultdict(int)
     detail: Dict[Tuple[str, str], list] = defaultdict(list)
     all_value_match: Dict[Tuple[str, str], bool] = defaultdict(lambda: True)
 
@@ -272,16 +278,26 @@ def build_sheet_graph(edges: List[RefEdge]) -> nx.DiGraph:
     for e in edges:
         key = (e.src_sheet, e.tgt_sheet)
         counts[key] += 1
+        if e.link_type == "value_match":
+            value_counts[key] += 1
+        else:
+            formula_counts[key] += 1
+            all_value_match[key] = False
         if len(detail[key]) < 8:  # cap sample detail per edge
             tag = _TAG.get(e.link_type, "")
             detail[key].append(f"{tag}{e.src_sheet}!{e.src_ref} -> {e.tgt_sheet}!{e.tgt_cell}")
-        if e.link_type != "value_match":
-            all_value_match[key] = False
         G.add_node(e.src_sheet)
         G.add_node(e.tgt_sheet)
 
     for (src, tgt), n in counts.items():
-        G.add_edge(src, tgt, weight=n, detail=detail[(src, tgt)], value_match_only=all_value_match[(src, tgt)])
+        G.add_edge(
+            src, tgt,
+            weight=n,
+            value_count=value_counts[(src, tgt)],
+            formula_count=formula_counts[(src, tgt)],
+            detail=detail[(src, tgt)],
+            value_match_only=all_value_match[(src, tgt)],
+        )
 
     return G
 
@@ -702,7 +718,8 @@ def swimlane_figure(
             )
             ax.add_patch(arrow)
             mx, my = (x1 + x2) / 2, (y1 + y2) / 2
-            ax.text(mx, my, f"~{data.get('weight', '')}", fontsize=8, color="#333",
+            label = f"~{data.get('value_count', 0)}/{data.get('formula_count', 0)}"
+            ax.text(mx, my, label, fontsize=8, color="#333",
                     ha="center", va="center",
                     bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.8))
 
@@ -876,10 +893,13 @@ def swimlane_html_string(
             x1, y1 = xy[u]
             x2, y2 = xy[v]
             weight = data.get("weight", 1)
+            value_count = data.get("value_count", 0)
+            formula_count = data.get("formula_count", 0)
             detail = data.get("detail", [])
             tooltip = esc("\n".join(detail)) if detail else esc(f"{u} -> {v} ({weight})")
             lw = 1 + min(weight / 5, 3)
             path_d, cx, cy = curved_edge_path(x1, y1, x2, y2, half_w, half_h)
+            label = f"~{value_count}/{formula_count}"
             svg_parts.append(
                 f'<g class="edge" data-src="{esc(u)}" data-tgt="{esc(v)}">'
                 f'<path d="{path_d}" stroke="#555" '
@@ -887,7 +907,7 @@ def swimlane_html_string(
                 f'<title>{tooltip}</title>'
                 f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="9" fill="white" opacity="0.85"/>'
                 f'<text x="{cx:.1f}" y="{cy:.1f}" font-size="10" text-anchor="middle" '
-                f'dominant-baseline="middle" fill="#333">~{weight}</text>'
+                f'dominant-baseline="middle" fill="#333">{label}</text>'
                 f'</g>'
             )
 
