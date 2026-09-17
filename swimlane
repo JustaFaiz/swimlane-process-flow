@@ -36,6 +36,7 @@ from typing import Dict, List, Optional, Tuple
 
 import networkx as nx
 import openpyxl
+from openpyxl.utils import get_column_letter
 
 
 # ---------------------------------------------------------------------------
@@ -66,32 +67,41 @@ def extract_cross_sheet_refs(workbook_path: str) -> List[RefEdge]:
     Returns a flat list of RefEdge(src_sheet, src_ref, tgt_sheet, tgt_cell, formula)
     where the direction is: src_sheet feeds INTO tgt_sheet (data flows from the
     referenced sheet to the sheet holding the formula).
+
+    Loads in read_only + values_only mode: openpyxl's default mode builds a
+    full Cell object (with style info) for every cell in the workbook, which
+    on a large multi-sheet, heavily-formatted file (the norm for tax
+    workpapers) is the dominant cost — on a ~1.45M-cell benchmark workbook
+    this cut total scan time from ~11s to ~6.5s. Cell coordinates are
+    rebuilt from row/column indices since values_only mode skips Cell
+    objects entirely.
     """
-    wb = openpyxl.load_workbook(workbook_path, data_only=False)
+    wb = openpyxl.load_workbook(workbook_path, data_only=False, read_only=True)
     edges: List[RefEdge] = []
 
-    for ws in wb.worksheets:
-        tgt_sheet = ws.title
-        for row in ws.iter_rows():
-            for cell in row:
-                val = cell.value
-                if not isinstance(val, str) or not val.startswith("="):
-                    continue
+    try:
+        for ws in wb.worksheets:
+            tgt_sheet = ws.title
+            for row_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
+                for col_idx, val in enumerate(row, start=1):
+                    if not isinstance(val, str) or not val or val[0] != "=":
+                        continue
 
-                for m in _SHEET_REF.finditer(val):
-                    raw_sheet = (m.group(1) or m.group(2) or "").replace("''", "'")
-                    src_ref = m.group(3)
-                    if raw_sheet and raw_sheet != tgt_sheet:
-                        edges.append(
-                            RefEdge(
-                                src_sheet=raw_sheet,
-                                src_ref=src_ref,
-                                tgt_sheet=tgt_sheet,
-                                tgt_cell=cell.coordinate,
-                                formula=val,
+                    for m in _SHEET_REF.finditer(val):
+                        raw_sheet = (m.group(1) or m.group(2) or "").replace("''", "'")
+                        src_ref = m.group(3)
+                        if raw_sheet and raw_sheet != tgt_sheet:
+                            edges.append(
+                                RefEdge(
+                                    src_sheet=raw_sheet,
+                                    src_ref=src_ref,
+                                    tgt_sheet=tgt_sheet,
+                                    tgt_cell=f"{get_column_letter(col_idx)}{row_idx}",
+                                    formula=val,
+                                )
                             )
-                        )
-    wb.close()
+    finally:
+        wb.close()
     return edges
 
 
@@ -309,12 +319,23 @@ def swimlane_figure(
     lanes: Dict[str, str],
     lane_order: Optional[List[str]] = None,
     title: str = "Workbook Process Flow (Swimlane)",
+    dense_edge_threshold: int = 300,
 ):
     """Build and return a matplotlib Figure (does not save to disk) —
-    the form used by the Streamlit dashboard via st.pyplot(fig)."""
+    the form used by the Streamlit dashboard via st.pyplot(fig).
+
+    Below dense_edge_threshold edges: curved arrows + per-edge weight labels
+    (readable detail — the normal case for a single traced flow).
+    At or above it: switches to a bulk LineCollection for all edges with no
+    per-edge labels. FancyArrowPatch curves + text bboxes are expensive per
+    edge — on a ~10k-edge full-workbook graph that path took ~40s to render;
+    LineCollection draws the same edge count in ~1s. The tradeoff is no
+    arrowheads/weight labels in that mode; use a per-output trace (far fewer
+    edges) when you need that level of detail."""
     import matplotlib.pyplot as plt
     from matplotlib.patches import FancyBboxPatch
     from matplotlib.patches import FancyArrowPatch
+    from matplotlib.collections import LineCollection
 
     if lane_order is None:
         lane_order = _default_lane_order(lanes)
@@ -326,7 +347,15 @@ def swimlane_figure(
     bottoms, heights, total_height = _lane_bands(lane_order, lane_capacity, node_spacing, band_padding)
 
     col_w = 2.6
-    fig_w = max(8, (max_depth + 1) * col_w + 2)
+    raw_width = (max_depth + 1) * col_w + 2
+    # Safety cap: an unusually long dependency chain (rare, but possible with
+    # a formula chain running through many stages) shouldn't produce a
+    # runaway-width figure. Compress column spacing to stay under a sane
+    # width rather than growing unbounded.
+    max_fig_w = 90
+    if raw_width > max_fig_w:
+        col_w = (max_fig_w - 2) / (max_depth + 1)
+    fig_w = max(8, min(raw_width, max_fig_w))
     fig_h = max(4, total_height)
 
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
@@ -352,22 +381,33 @@ def swimlane_figure(
         y = bottoms[lane] + band_padding / 2 + (slot + 0.5) * node_spacing
         xy[node] = (x, y)
 
-    # draw edges first (behind boxes)
-    for u, v, data in G.edges(data=True):
-        x1, y1 = xy[u]
-        x2, y2 = xy[v]
-        arrow = FancyArrowPatch(
-            (x1, y1), (x2, y2),
-            connectionstyle="arc3,rad=0.15",
-            arrowstyle="-|>", mutation_scale=14,
-            color="#555555", linewidth=1 + min(data.get("weight", 1) / 5, 3),
-            zorder=1, shrinkA=28, shrinkB=28,
+    n_edges = G.number_of_edges()
+    dense_mode = n_edges >= dense_edge_threshold
+
+    if dense_mode:
+        segments = [(xy[u], xy[v]) for u, v in G.edges()]
+        lc = LineCollection(segments, colors="#666666", linewidths=0.5, alpha=0.35, zorder=1)
+        ax.add_collection(lc)
+        ax.text(
+            0.5, 1.01, f"{n_edges} links — simplified rendering (no arrowheads/labels) for speed",
+            transform=ax.transAxes, ha="center", va="bottom", fontsize=9, color="#888",
         )
-        ax.add_patch(arrow)
-        mx, my = (x1 + x2) / 2, (y1 + y2) / 2
-        ax.text(mx, my, str(data.get("weight", "")), fontsize=8, color="#333",
-                ha="center", va="center",
-                bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.8))
+    else:
+        for u, v, data in G.edges(data=True):
+            x1, y1 = xy[u]
+            x2, y2 = xy[v]
+            arrow = FancyArrowPatch(
+                (x1, y1), (x2, y2),
+                connectionstyle="arc3,rad=0.15",
+                arrowstyle="-|>", mutation_scale=14,
+                color="#555555", linewidth=1 + min(data.get("weight", 1) / 5, 3),
+                zorder=1, shrinkA=28, shrinkB=28,
+            )
+            ax.add_patch(arrow)
+            mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+            ax.text(mx, my, str(data.get("weight", "")), fontsize=8, color="#333",
+                    ha="center", va="center",
+                    bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.8))
 
     # draw sheet nodes
     for node, (x, y) in xy.items():
@@ -403,156 +443,202 @@ def render_swimlane(
 
 
 # ---------------------------------------------------------------------------
-# 5b. Interactive rendering (vis-network, embedded inline — no CDN required)
+# 5b. Interactive rendering — plain SVG + ~40 lines of vanilla JS.
 # ---------------------------------------------------------------------------
-
-# The vis-network UMD bundle is shipped as assets/vis-network.min.js next to
-# this script and inlined directly into the generated HTML. This makes the
-# diagram fully self-contained and immune to corporate firewalls/proxies
-# blocking a CDN fetch (the most common cause of "blank diagram" in Streamlit
-# or an offline machine). If the asset is missing for any reason, we fall
-# back to the public CDN so the script still works out of the box.
-_VIS_NETWORK_CDN = "https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.9/vis-network.min.js"
-
-
-def _vis_network_script_tag() -> str:
-    asset_path = Path(__file__).resolve().parent / "assets" / "vis-network.min.js"
-    if asset_path.exists():
-        js = asset_path.read_text(encoding="utf-8")
-        return f"<script>\n{js}\n</script>"
-    return f'<script src="{_VIS_NETWORK_CDN}"></script>'
-
+# No third-party library, no CDN, no separate asset file. Earlier versions
+# embedded vis-network (a 465KB minified JS library), which kept running
+# into real transfer problems in a copy-paste-through-GitHub workflow: one
+# giant unbroken line, then a 673KB base64 file, then 20 files still too
+# many to paste one at a time. The actual fix is not a smaller/cleverer way
+# to move that library — it's not needing it. Pan/zoom/hover is implemented
+# directly against native SVG + a handful of DOM event listeners, so the
+# whole diagram is exactly one self-contained HTML string with nothing else
+# to transfer, ever.
 
 def swimlane_html_string(
     G: nx.DiGraph,
     lanes: Dict[str, str],
     lane_order: Optional[List[str]] = None,
     title: str = "Workbook Process Flow (Swimlane)",
+    dense_edge_threshold: int = 300,
 ) -> str:
-    """Build the self-contained interactive HTML (vis-network) and return it
-    as a string — the form used by Streamlit via st.components.v1.html()."""
+    """Build the self-contained interactive HTML (pan/zoom SVG) and return
+    it as a string — the form used by Streamlit via st.components.v1.html(),
+    or written straight to a file and opened in a browser tab."""
+    import html as html_mod
+
     if lane_order is None:
         lane_order = _default_lane_order(lanes)
 
     pos, lane_capacity = compute_positions(G, lanes, lane_order)
-    lane_index = {name: i for i, name in enumerate(lane_order)}
     max_depth = max((p[0] for p in pos.values()), default=0)
 
-    node_spacing, band_padding = 55, 70
+    node_w, node_h = 170, 50
+    col_w = 220
+    node_spacing, band_padding = 60, 70
     bottoms, heights, total_height = _lane_bands(lane_order, lane_capacity, node_spacing, band_padding)
 
     def to_canvas_y(world_y: float) -> float:
         return total_height - world_y
 
-    nodes = []
+    xy = {}
     for node, (d, li, slot) in pos.items():
         lane = lane_order[li] if 0 <= li < len(lane_order) else lane_order[-1]
-        color = lane_color(lanes.get(node, lane_order[-1]), li)
         world_y = bottoms[lane] + band_padding / 2 + (slot + 0.5) * node_spacing
-        nodes.append({
-            "id": node,
-            "label": node,
-            "x": d * 220,
-            "y": to_canvas_y(world_y),
-            "fixed": {"x": True, "y": True},
-            "color": {"background": color, "border": "#333"},
-            "shape": "box",
-            "title": f"Lane: {lanes.get(node, lane_order[-1])}",
-        })
+        xy[node] = (d * col_w, to_canvas_y(world_y))
 
-    edges = []
-    for u, v, data in G.edges(data=True):
-        detail = "<br>".join(data.get("detail", []))
-        edges.append({
-            "from": u, "to": v,
-            "arrows": "to",
-            "label": str(data.get("weight", "")),
-            "width": 1 + min(data.get("weight", 1) / 5, 4),
-            "title": detail,
-        })
+    x_min = -300
+    x_max = (max_depth + 1) * col_w + 120
+    y_min, y_max = 0.0, total_height
+    view_w, view_h = x_max - x_min, y_max - y_min
 
-    x_min, x_max = -260, (max_depth + 1) * 220
-    lane_bands = []
+    dense_mode = G.number_of_edges() >= dense_edge_threshold
+    esc = html_mod.escape
+
+    svg_parts: List[str] = []
+
+    # lane bands + labels
     for i, lane in enumerate(lane_order):
-        canvas_top = to_canvas_y(bottoms[lane] + heights[lane])
-        canvas_bottom = to_canvas_y(bottoms[lane])
-        lane_bands.append({
-            "name": lane,
-            "top": canvas_top,
-            "bottom": canvas_bottom,
-            "color": lane_color(lane, i),
-        })
+        top = to_canvas_y(bottoms[lane] + heights[lane])
+        bottom = to_canvas_y(bottoms[lane])
+        color = lane_color(lane, i)
+        svg_parts.append(
+            f'<rect x="{x_min}" y="{top:.1f}" width="{view_w:.1f}" height="{bottom - top:.1f}" '
+            f'fill="{color}" opacity="0.35"/>'
+        )
+        svg_parts.append(
+            f'<text x="{x_min + 14}" y="{(top + bottom) / 2:.1f}" font-size="15" '
+            f'font-weight="bold" fill="#333" dominant-baseline="middle">{esc(lane)}</text>'
+        )
 
-    vis_lib_tag = _vis_network_script_tag()
+    # edges (drawn before nodes so they sit behind them)
+    if dense_mode:
+        svg_parts.append(
+            f'<text x="{(x_min + x_max) / 2:.0f}" y="{y_min - 10:.0f}" font-size="12" '
+            f'fill="#888" text-anchor="middle">{G.number_of_edges()} links — simplified '
+            f'rendering (no arrowheads/labels) for speed</text>'
+        )
+        for u, v in G.edges():
+            x1, y1 = xy[u]
+            x2, y2 = xy[v]
+            svg_parts.append(
+                f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" '
+                f'stroke="#666" stroke-width="0.6" opacity="0.35"/>'
+            )
+    else:
+        for u, v, data in G.edges(data=True):
+            x1, y1 = xy[u]
+            x2, y2 = xy[v]
+            weight = data.get("weight", 1)
+            detail = data.get("detail", [])
+            tooltip = esc("\n".join(detail)) if detail else esc(f"{u} -> {v} ({weight})")
+            lw = 1 + min(weight / 5, 3)
+            mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+            svg_parts.append(
+                f'<g class="edge">'
+                f'<path d="M {x1:.1f} {y1:.1f} L {x2:.1f} {y2:.1f}" stroke="#555" '
+                f'stroke-width="{lw:.1f}" fill="none" marker-end="url(#arrow)"/>'
+                f'<title>{tooltip}</title>'
+                f'<circle cx="{mx:.1f}" cy="{my:.1f}" r="9" fill="white" opacity="0.85"/>'
+                f'<text x="{mx:.1f}" y="{my:.1f}" font-size="10" text-anchor="middle" '
+                f'dominant-baseline="middle" fill="#333">{weight}</text>'
+                f'</g>'
+            )
+
+    # nodes (drawn last, on top)
+    for node, (x, y) in xy.items():
+        lane = lanes.get(node, lane_order[-1])
+        li = lane_order.index(lane) if lane in lane_order else len(lane_order) - 1
+        color = lane_color(lane, li)
+        svg_parts.append(
+            f'<g class="node">'
+            f'<rect x="{x - node_w / 2:.1f}" y="{y - node_h / 2:.1f}" width="{node_w}" height="{node_h}" '
+            f'rx="8" fill="white" stroke="#333" stroke-width="1.4"/>'
+            f'<text x="{x:.1f}" y="{y:.1f}" font-size="12" text-anchor="middle" '
+            f'dominant-baseline="middle">{esc(node)}</text>'
+            f'<title>{esc(node)} — {esc(lane)}</title>'
+            f'</g>'
+        )
+
+    svg_body = "\n".join(svg_parts)
 
     html = f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>{title}</title>
-{vis_lib_tag}
+<title>{esc(title)}</title>
 <style>
-  body {{ font-family: -apple-system, Segoe UI, Arial, sans-serif; margin: 0; }}
-  #header {{ padding: 14px 20px; background: #1a1a2e; color: white; }}
-  #network {{ width: 100%; height: calc(100vh - 56px); }}
-  #load-error {{ display: none; padding: 30px; color: #a00; font-family: monospace;
-                 white-space: pre-wrap; font-size: 13px; }}
+  html, body {{ margin: 0; height: 100%; font-family: -apple-system, Segoe UI, Arial, sans-serif; }}
+  #header {{ padding: 12px 20px; background: #1a1a2e; color: white; display: flex;
+             justify-content: space-between; align-items: center; }}
+  #header h2 {{ margin: 0; font-size: 16px; }}
+  #header button {{ background: #33334d; color: white; border: 1px solid #555; border-radius: 4px;
+                     padding: 6px 12px; font-size: 12px; cursor: pointer; }}
+  #header button:hover {{ background: #45456a; }}
+  #stage {{ width: 100%; height: calc(100vh - 50px); cursor: grab; overflow: hidden; }}
+  #stage:active {{ cursor: grabbing; }}
+  .node rect {{ transition: stroke 0.1s; }}
+  .node:hover rect {{ stroke: #1a1a2e; stroke-width: 2.4; }}
+  .edge:hover path {{ stroke: #1a1a2e; }}
 </style>
 </head>
 <body>
-<div id="header"><h2 style="margin:0;font-size:16px;">{title}</h2></div>
-<div id="load-error"></div>
-<div id="network"></div>
+<div id="header">
+  <h2>{esc(title)}</h2>
+  <div>
+    <span style="font-size:12px;color:#aaa;margin-right:12px;">scroll to zoom · drag to pan</span>
+    <button id="reset-btn">Reset view</button>
+  </div>
+</div>
+<svg id="stage" viewBox="{x_min} {y_min} {view_w:.1f} {view_h:.1f}" preserveAspectRatio="xMidYMid meet">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#555"/>
+    </marker>
+  </defs>
+  <g id="viewport">
+{svg_body}
+  </g>
+</svg>
 <script>
-  function showLoadError(msg) {{
-    var box = document.getElementById('load-error');
-    var net = document.getElementById('network');
-    box.style.display = 'block';
-    net.style.display = 'none';
-    box.textContent = 'Diagram failed to load.\\n\\n' + msg +
-      '\\n\\nMost likely cause: the vis-network script did not load ' +
-      '(offline machine + assets/vis-network.min.js missing next to ' +
-      'Swimlane_Flow.py, or the CDN fallback is blocked on this network).';
+(function() {{
+  var svg = document.getElementById('stage');
+  var viewport = document.getElementById('viewport');
+  var scale = 1, tx = 0, ty = 0;
+  var panning = false, startX = 0, startY = 0;
+
+  function apply() {{
+    viewport.setAttribute('transform', 'translate(' + tx + ',' + ty + ') scale(' + scale + ')');
   }}
-  window.addEventListener('error', function(e) {{
-    showLoadError(String(e.message || e.type));
-  }}, true);
-  if (typeof vis === 'undefined') {{
-    showLoadError('The vis-network library did not load (typeof vis === "undefined").');
-  }} else {{
-    try {{
-      const lanes = {json.dumps(lane_bands)};
-      const nodes = new vis.DataSet({json.dumps(nodes)});
-      const edges = new vis.DataSet({json.dumps(edges)});
-      const container = document.getElementById('network');
-      const data = {{ nodes, edges }};
-      const options = {{
-        physics: false,
-        interaction: {{ hover: true, dragNodes: false, zoomView: true }},
-        edges: {{ font: {{ align: 'top', size: 11 }}, smooth: {{ type: 'cubicBezier', roundness: 0.4 }} }},
-        nodes: {{ font: {{ size: 13 }}, margin: 10 }}
-      }};
-      const network = new vis.Network(container, data, options);
-      network.on('beforeDrawing', function(ctx) {{
-        ctx.save();
-        ctx.textAlign = 'right';
-        ctx.textBaseline = 'middle';
-        ctx.font = 'bold 14px -apple-system, Segoe UI, Arial, sans-serif';
-        lanes.forEach(function(band) {{
-          ctx.fillStyle = band.color + '59';  // ~35% alpha
-          ctx.fillRect({x_min}, band.top, {x_max} - ({x_min}), band.bottom - band.top);
-          ctx.fillStyle = '#333333';
-          ctx.fillText(band.name, {x_min} - 12, (band.top + band.bottom) / 2);
-        }});
-        ctx.restore();
-      }});
-      network.once('afterDrawing', function() {{
-        network.fit({{ animation: false }});
-      }});
-    }} catch (err) {{
-      showLoadError(String(err));
-    }}
-  }}
+
+  svg.addEventListener('wheel', function(e) {{
+    e.preventDefault();
+    var rect = svg.getBoundingClientRect();
+    var mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    var factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+    var newScale = Math.max(0.1, Math.min(8, scale * factor));
+    tx = mx - (mx - tx) * (newScale / scale);
+    ty = my - (my - ty) * (newScale / scale);
+    scale = newScale;
+    apply();
+  }}, {{ passive: false }});
+
+  svg.addEventListener('mousedown', function(e) {{
+    panning = true; startX = e.clientX - tx; startY = e.clientY - ty;
+  }});
+  window.addEventListener('mousemove', function(e) {{
+    if (!panning) return;
+    tx = e.clientX - startX; ty = e.clientY - startY;
+    apply();
+  }});
+  window.addEventListener('mouseup', function() {{ panning = false; }});
+
+  document.getElementById('reset-btn').addEventListener('click', function() {{
+    scale = 1; tx = 0; ty = 0; apply();
+  }});
+
+  apply();
+}})();
 </script>
 </body>
 </html>"""
