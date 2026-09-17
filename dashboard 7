@@ -1,0 +1,401 @@
+"""
+dashboard.py — Excel Cross-Sheet Process Flow Mapper
+
+Run with:
+    streamlit run dashboard.py
+
+Workflow:
+    1. Upload an .xlsx workbook.
+    2. Assign every sheet to one of the 3 process categories:
+       Input -> Calculations -> Output
+       (Input and Output are yours to assign deliberately; everything else
+        defaults to Calculations. A diagram only shows a band if a sheet in
+        it is actually part of that specific flow, so a trace that never
+        touches Input, say, just won't draw that band.)
+    3. View the full swimlane diagram (interactive or static).
+    4. Drill down into any single sheet to see the exact cell-level formulas
+       linking it to other sheets.
+    5. Trace one or more Output sheets individually — each gets its own
+       swimlane showing only the sheets that actually feed that output
+       (a separate diagram per end-to-end process flow).
+"""
+
+import io
+import platform
+import tempfile
+import webbrowser
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
+
+from Swimlane_Flow import (
+    ancestors_subgraph,
+    build_sheet_graph,
+    edges_for_subgraph,
+    export_flow_xlsx,
+    extract_cross_sheet_refs,
+    full_flow_subgraph,
+    list_sheet_names,
+    relevant_flow_subgraph,
+    suggest_lane,
+    swimlane_figure,
+    swimlane_html_string,
+)
+
+LANES = ["Input", "Calculations", "Output"]
+
+st.set_page_config(page_title="Excel Process Flow Mapper", layout="wide")
+st.title("Excel Cross-Sheet Process Flow Mapper")
+st.caption(
+    "Upload a workbook, classify each sheet into a process lane, and see how "
+    "formulas actually flow between sheets — as a swimlane diagram."
+)
+
+
+@st.cache_data(show_spinner="Scanning formulas for cross-sheet references...")
+def parse_workbook(file_bytes: bytes):
+    edges = extract_cross_sheet_refs(io.BytesIO(file_bytes))
+    G = build_sheet_graph(edges)
+    return edges, G
+
+
+def open_in_browser_tab(html: str, filename_hint: str):
+    """Write the interactive HTML to a temp file and pop it open in the
+    system's default browser as its own tab — same behavior as the standalone
+    sheet-flow visualizer, and avoids Streamlit's embedded-iframe rendering
+    (which can come up blank if the diagram won't fit an inline frame)."""
+    tmp_dir = Path(tempfile.gettempdir()) / "excel_swimlane_views"
+    tmp_dir.mkdir(exist_ok=True)
+    out_path = tmp_dir / f"{filename_hint}.html"
+    out_path.write_text(html, encoding="utf-8")
+    opened = webbrowser.open_new_tab(out_path.resolve().as_uri())
+    if not opened:
+        st.warning(
+            "Couldn't auto-open a browser tab from this environment. "
+            "Use the download button below instead."
+        )
+    return out_path
+
+
+def clean_cell_ref(ref: str) -> str:
+    """Turn a RefEdge.src_ref/tgt_cell into something Excel's Range() will
+    accept: strip the 'Name \u2192 ref' prefix named-range edges use for
+    display, and drop $ anchors."""
+    ref = ref.strip()
+    if "\u2192" in ref:
+        ref = ref.split("\u2192", 1)[1].strip()
+    return ref.replace("$", "")
+
+
+def jump_to_cell_in_excel(workbook_name_hint: str, sheet_name: str, cell_ref: str, file_path: str = ""):
+    """Jump to a specific sheet/cell in a live Excel instance via COM
+    (pywin32) — Windows + Excel + pywin32 only, since this is exactly the
+    kind of local automation a browser page can never do on its own.
+
+    Tries to find the workbook already open in Excel first (matched by
+    filename), and only opens it fresh from `file_path` if it isn't. This
+    means the common case — you already have the workbook open while using
+    this dashboard — needs no file path at all.
+    """
+    if platform.system() != "Windows":
+        raise RuntimeError(
+            "This needs Windows + Excel + pywin32 — COM automation isn't "
+            "available on this OS."
+        )
+    try:
+        import win32com.client
+    except ImportError as e:
+        raise RuntimeError(
+            "pywin32 isn't installed in this environment. Install it with: "
+            "pip install pywin32"
+        ) from e
+
+    try:
+        excel = win32com.client.GetActiveObject("Excel.Application")
+    except Exception:
+        excel = win32com.client.Dispatch("Excel.Application")
+    excel.Visible = True
+
+    target_wb = None
+    name_stem = Path(workbook_name_hint).stem.lower()
+    for wb in excel.Workbooks:
+        if wb.Name.lower() == workbook_name_hint.lower() or Path(wb.Name).stem.lower() == name_stem:
+            target_wb = wb
+            break
+
+    if target_wb is None:
+        if not file_path:
+            raise RuntimeError(
+                f"'{workbook_name_hint}' isn't currently open in Excel. "
+                "Give the file path below to open it, or open the workbook "
+                "in Excel yourself first."
+            )
+        target_wb = excel.Workbooks.Open(file_path)
+
+    target_wb.Activate()
+    ws = target_wb.Worksheets(sheet_name)
+    ws.Activate()
+    ws.Range(clean_cell_ref(cell_ref)).Select()
+
+    try:
+        import win32con
+        import win32gui
+        win32gui.ShowWindow(excel.Hwnd, win32con.SW_RESTORE)
+        win32gui.SetForegroundWindow(excel.Hwnd)
+    except Exception:
+        pass  # best-effort focus; the cell is still selected either way
+
+
+def render(G, lanes, title, key_prefix: str, height: int = 620):
+    """Static preview inline (always reliable) + a button to pop the full
+    interactive version open in its own browser tab, plus download options.
+
+    Lane bands are shown only if a sheet in *this* view actually uses them —
+    a lane is skipped for a flow that never touches it, rather than always
+    drawing all 3 bands regardless of content."""
+    if G.number_of_nodes() == 0:
+        st.info("Nothing to show — no sheets in this view.")
+        return
+
+    used_lanes = {lanes.get(n) for n in G.nodes}
+    active_order = [l for l in LANES if l in used_lanes] or LANES
+    filtered_edges = edges_for_subgraph(edges, G)  # `edges` = module-level full edge list
+
+    fig = swimlane_figure(G, lanes, lane_order=active_order, title=title)
+
+    if G.number_of_nodes() > 25:
+        st.caption(
+            f"{G.number_of_nodes()} sheets in this view — the inline preview below "
+            "is shrunk to fit the page and won't be readable at this size. "
+            "Open the interactive version (zoomable/pannable, click a sheet for "
+            "details) instead. For a genuinely readable single diagram, use "
+            "section 4 to trace one output at a time rather than the full workbook."
+        )
+
+    # Native resolution — do NOT squeeze to the Streamlit column width, since
+    # that's what made large diagrams unreadable (161 sheets compressed into
+    # a few inches of screen). The tradeoff is the preview may be wider than
+    # the page; use the download/open-in-tab options below for anything big.
+    st.pyplot(fig, use_container_width=False)
+
+    html = swimlane_html_string(
+        G, lanes, lane_order=active_order, title=title, raw_edges=filtered_edges
+    )
+    xlsx_bytes = export_flow_xlsx(G, lanes, filtered_edges)
+
+    c1, c2, c3 = st.columns([1, 1, 1])
+    with c1:
+        if st.button("Open interactive version in browser tab", key=f"{key_prefix}_open"):
+            open_in_browser_tab(html, key_prefix)
+    with c2:
+        st.download_button(
+            "Download interactive HTML",
+            data=html,
+            file_name=f"{key_prefix}.html",
+            mime="text/html",
+            key=f"{key_prefix}_dl",
+        )
+    with c3:
+        st.download_button(
+            "Download as XLSX",
+            data=xlsx_bytes,
+            file_name=f"{key_prefix}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"{key_prefix}_xlsx_dl",
+        )
+
+
+uploaded = st.file_uploader("Upload workbook (.xlsx)", type=["xlsx"])
+
+if not uploaded:
+    st.info("Upload an .xlsx workbook to get started.")
+    st.stop()
+
+file_bytes = uploaded.getvalue()
+edges, G = parse_workbook(file_bytes)
+all_sheets = list_sheet_names(io.BytesIO(file_bytes))
+for s in all_sheets:
+    G.add_node(s)  # keep sheets with no cross-sheet formulas visible too
+
+st.success(
+    f"Found {len(edges)} cross-sheet formula references across "
+    f"{len(all_sheets)} sheets ({G.number_of_edges()} sheet-to-sheet links)."
+)
+
+# ---------------------------------------------------------------------------
+# 1. Lane assignment — one row per sheet, each with its own category dropdown
+# ---------------------------------------------------------------------------
+st.header("1. Assign sheets to the 5 process categories")
+st.caption(
+    "Click a row's Category cell to change it — reassigning a sheet is always "
+    "just editing that one cell, whatever category it's currently in. "
+    "Click the column header to sort, or use the search box below."
+)
+
+sorted_sheets = sorted(all_sheets)
+
+if "lane_df" not in st.session_state or st.session_state.get("_wb_key") != uploaded.name:
+    # (Re)initialize from the heuristic guess only when a new workbook is loaded
+    seed = {s: suggest_lane(G.in_degree(s), G.out_degree(s)) for s in all_sheets}
+    st.session_state.lane_df = pd.DataFrame(
+        {"Sheet": sorted_sheets, "Category": [seed[s] for s in sorted_sheets]}
+    )
+    st.session_state._wb_key = uploaded.name
+
+search = st.text_input("Filter sheets by name", key="sheet_filter")
+display_df = st.session_state.lane_df
+if search:
+    display_df = display_df[display_df["Sheet"].str.contains(search, case=False, na=False)]
+
+edited = st.data_editor(
+    display_df,
+    column_config={
+        "Sheet": st.column_config.TextColumn("Sheet", disabled=True),
+        "Category": st.column_config.SelectboxColumn("Category", options=LANES, required=True),
+    },
+    hide_index=True,
+    use_container_width=True,
+    height=500,
+    key="lane_editor",
+)
+
+# Merge edits back (the editor only shows the filtered subset when searching,
+# so write those rows back into the full table rather than replacing it).
+st.session_state.lane_df.set_index("Sheet", inplace=True)
+edited_indexed = edited.set_index("Sheet")
+st.session_state.lane_df.update(edited_indexed)
+st.session_state.lane_df.reset_index(inplace=True)
+
+lane_map = dict(zip(st.session_state.lane_df["Sheet"], st.session_state.lane_df["Category"]))
+
+with st.expander("Lane summary"):
+    for lane in LANES:
+        members = [s for s, l in lane_map.items() if l == lane]
+        st.write(f"**{lane}** ({len(members)}): {', '.join(members) if members else '—'}")
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# 2. Full process flow
+# ---------------------------------------------------------------------------
+st.header("2. Full process flow")
+if st.button("Build full swimlane diagram", type="primary"):
+    render(G, lane_map, "Full Process Flow", key_prefix="full_flow")
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# 3. Drill down into a single sheet
+# ---------------------------------------------------------------------------
+st.header("3. Drill down into a sheet")
+st.caption("See every cell-level formula link feeding into or out of a chosen sheet.")
+
+drill_sheet = st.selectbox("Sheet", sorted_sheets, key="drill_sheet")
+sheet_edges = [
+    e for e in edges if e.src_sheet == drill_sheet or e.tgt_sheet == drill_sheet
+]
+
+if sheet_edges:
+    df = pd.DataFrame(
+        [
+            {
+                "Direction": "in" if e.tgt_sheet == drill_sheet else "out",
+                "Source sheet": e.src_sheet,
+                "Source ref": e.src_ref,
+                "Target sheet": e.tgt_sheet,
+                "Target cell": e.tgt_cell,
+                "Formula": e.formula,
+            }
+            for e in sheet_edges
+        ]
+    )
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    with st.expander("Jump to a cell in Excel (Windows + pywin32 only)"):
+        st.caption(
+            "If the workbook is already open in Excel, this jumps straight to the cell. "
+            "If not, give its file path below and it'll be opened first."
+        )
+        file_path_hint = st.text_input(
+            "Workbook file path (only needed if it's not already open in Excel)",
+            key=f"excel_path_hint_{drill_sheet}",
+        )
+        row_labels = [
+            f"[{e.link_type}] {e.src_sheet}!{e.src_ref}  \u2192  {e.tgt_sheet}!{e.tgt_cell}"
+            for e in sheet_edges
+        ]
+        row_idx = st.selectbox(
+            "Connection", range(len(sheet_edges)),
+            format_func=lambda i: row_labels[i], key=f"jump_row_{drill_sheet}",
+        )
+        side = st.radio(
+            "Jump to", ["Source cell", "Target cell"], horizontal=True, key=f"jump_side_{drill_sheet}"
+        )
+        if st.button("Open in Excel", key=f"jump_btn_{drill_sheet}"):
+            chosen = sheet_edges[row_idx]
+            if side == "Source cell":
+                target_sheet, target_cell = chosen.src_sheet, chosen.src_ref
+            else:
+                target_sheet, target_cell = chosen.tgt_sheet, chosen.tgt_cell
+            try:
+                jump_to_cell_in_excel(uploaded.name, target_sheet, target_cell, file_path_hint)
+                st.success(f"Jumped to {target_sheet}!{clean_cell_ref(target_cell)} in Excel.")
+            except Exception as ex:
+                st.error(str(ex))
+
+    neighbor_nodes = {drill_sheet} | set(G.predecessors(drill_sheet)) | set(G.successors(drill_sheet))
+    local_G = G.subgraph(neighbor_nodes).copy()
+    if st.toggle("Show local diagram (this sheet + direct neighbors)", key="show_local"):
+        render(local_G, lane_map, f"Immediate neighbors of {drill_sheet}", key_prefix=f"local_{drill_sheet}", height=420)
+
+    full_G = full_flow_subgraph(G, drill_sheet)
+    relevant_G = relevant_flow_subgraph(G, edges, drill_sheet)
+    noise_count = full_G.number_of_nodes() - relevant_G.number_of_nodes()
+
+    st.caption(
+        f"Full input\u2192output flow through `{drill_sheet}`: {relevant_G.number_of_nodes()} sheets "
+        "that actually sit on a real cell-level data path to or from this sheet"
+        + (f" ({noise_count} unrelated sheet(s) filtered out — connected to an intermediate "
+           "sheet, but through different, unrelated cells)" if noise_count > 0 else "")
+        + "."
+    )
+    if st.toggle("Show full input\u2192output flow for this sheet", key="show_full_flow"):
+        render(relevant_G, lane_map, f"Full flow through {drill_sheet}", key_prefix=f"fullflow_{drill_sheet}", height=480)
+        if noise_count > 0 and st.toggle(
+            f"Show unfiltered version too ({full_G.number_of_nodes()} sheets, includes the "
+            "unrelated ones)", key="show_full_flow_unfiltered"
+        ):
+            render(full_G, lane_map, f"Full flow through {drill_sheet} (unfiltered)",
+                   key_prefix=f"fullflow_unfiltered_{drill_sheet}", height=480)
+else:
+    st.info("No cross-sheet formulas reference this sheet.")
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# 4. Trace individual output flows (multiple swimlanes, one per process)
+# ---------------------------------------------------------------------------
+st.header("4. Trace individual output flows")
+st.caption(
+    "Each Output sheet usually represents a distinct end-to-end process. "
+    "Pick one or more and get a separate swimlane per output, showing only "
+    "the sheets that actually feed it — no unrelated branches."
+)
+
+output_sheets = [s for s, l in lane_map.items() if l == "Output"]
+target_pool = output_sheets if output_sheets else sorted_sheets
+chosen = st.multiselect(
+    "Output sheet(s) to trace", sorted(target_pool), default=sorted(output_sheets), key="trace_targets"
+)
+
+if st.button("Generate flow diagram(s)"):
+    if not chosen:
+        st.warning("Pick at least one sheet to trace.")
+    for target in chosen:
+        sub_G = ancestors_subgraph(G, target)
+        sub_lanes = {n: lane_map.get(n, "Calculations") for n in sub_G.nodes}
+        st.subheader(f"Flow ending at `{target}`")
+        st.caption(f"{sub_G.number_of_nodes()} sheets · {sub_G.number_of_edges()} sheet-to-sheet links")
+        render(sub_G, sub_lanes, f"Flow: {target}", key_prefix=f"flow_{target}", height=480)
+
