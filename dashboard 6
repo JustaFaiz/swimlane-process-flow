@@ -31,6 +31,8 @@ import streamlit as st
 from Swimlane_Flow import (
     ancestors_subgraph,
     build_sheet_graph,
+    edges_for_subgraph,
+    export_flow_xlsx,
     extract_cross_sheet_refs,
     full_flow_subgraph,
     list_sheet_names,
@@ -77,8 +79,7 @@ def open_in_browser_tab(html: str, filename_hint: str):
 
 def render(G, lanes, title, key_prefix: str, height: int = 620):
     """Static preview inline (always reliable) + a button to pop the full
-    interactive version open in its own browser tab, plus a download
-    fallback for remote/headless setups.
+    interactive version open in its own browser tab, plus download options.
 
     Lane bands are shown only if a sheet in *this* view actually uses them —
     a lane is skipped for a flow that never touches it, rather than always
@@ -89,6 +90,7 @@ def render(G, lanes, title, key_prefix: str, height: int = 620):
 
     used_lanes = {lanes.get(n) for n in G.nodes}
     active_order = [l for l in LANES if l in used_lanes] or LANES
+    filtered_edges = edges_for_subgraph(edges, G)  # `edges` = module-level full edge list
 
     fig = swimlane_figure(G, lanes, lane_order=active_order, title=title)
 
@@ -96,9 +98,9 @@ def render(G, lanes, title, key_prefix: str, height: int = 620):
         st.caption(
             f"{G.number_of_nodes()} sheets in this view — the inline preview below "
             "is shrunk to fit the page and won't be readable at this size. "
-            "Download the full-resolution image or open the interactive version "
-            "(zoomable/pannable) instead. For a genuinely readable single diagram, "
-            "use section 4 to trace one output at a time rather than the full workbook."
+            "Open the interactive version (zoomable/pannable, click a sheet for "
+            "details) instead. For a genuinely readable single diagram, use "
+            "section 4 to trace one output at a time rather than the full workbook."
         )
 
     # Native resolution — do NOT squeeze to the Streamlit column width, since
@@ -107,10 +109,11 @@ def render(G, lanes, title, key_prefix: str, height: int = 620):
     # the page; use the download/open-in-tab options below for anything big.
     st.pyplot(fig, use_container_width=False)
 
-    png_buf = io.BytesIO()
-    fig.savefig(png_buf, format="png", dpi=200, bbox_inches="tight")
+    html = swimlane_html_string(
+        G, lanes, lane_order=active_order, title=title, raw_edges=filtered_edges
+    )
+    xlsx_bytes = export_flow_xlsx(G, lanes, filtered_edges)
 
-    html = swimlane_html_string(G, lanes, lane_order=active_order, title=title)
     c1, c2, c3 = st.columns([1, 1, 1])
     with c1:
         if st.button("Open interactive version in browser tab", key=f"{key_prefix}_open"):
@@ -125,11 +128,11 @@ def render(G, lanes, title, key_prefix: str, height: int = 620):
         )
     with c3:
         st.download_button(
-            "Download full-resolution PNG",
-            data=png_buf.getvalue(),
-            file_name=f"{key_prefix}.png",
-            mime="image/png",
-            key=f"{key_prefix}_png_dl",
+            "Download as XLSX",
+            data=xlsx_bytes,
+            file_name=f"{key_prefix}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"{key_prefix}_xlsx_dl",
         )
 
 
