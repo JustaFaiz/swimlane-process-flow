@@ -169,20 +169,42 @@ def extract_cross_sheet_refs(
     this cut total scan time from ~11s to ~6.5s. Cell coordinates are
     rebuilt from row/column indices since values_only mode skips Cell
     objects entirely.
+
+    When match_values is on, the workbook is loaded a second time with
+    data_only=True so a formula cell's last-calculated result (e.g. a SUM
+    of 4 rows) can also feed the value-matching index, not just literal
+    pasted values — otherwise a genuinely matching figure that happens to
+    be formula-computed on one side is invisible to value-matching
+    entirely, since the first pass only ever sees that cell's formula
+    text, never what it evaluates to.
     """
     wb = openpyxl.load_workbook(workbook_path, data_only=False, read_only=True)
+    wb_vals = openpyxl.load_workbook(workbook_path, data_only=True, read_only=True) if match_values else None
     edges: List[RefEdge] = []
-    # value_key -> list of (sheet_position, sheet_name, cell_coord)
+    # value_key -> list of (sheet_position, sheet_name, cell_coord, display, exact)
     value_index: Dict[str, list] = defaultdict(list)
 
     try:
         named_targets = _resolve_defined_names(wb)
         name_pattern = _named_range_pattern(list(named_targets.keys()))
         sheet_position = {ws.title: i for i, ws in enumerate(wb.worksheets)}
+        val_sheets = {ws.title: ws for ws in wb_vals.worksheets} if wb_vals is not None else {}
+
+        def _index_value(v, tgt_sheet: str, coord: str):
+            result = _numeric_id_key(v)
+            if result is not None:
+                key, display, exact = result
+                if len(key.lstrip("-")) >= min_value_length:
+                    value_index[key].append((sheet_position[tgt_sheet], tgt_sheet, coord, display, exact))
 
         for ws in wb.worksheets:
             tgt_sheet = ws.title
-            for row_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
+            val_ws = val_sheets.get(tgt_sheet)
+            rows = ws.iter_rows(values_only=True)
+            val_rows = val_ws.iter_rows(values_only=True) if val_ws is not None else None
+
+            for row_idx, row in enumerate(rows, start=1):
+                val_row = next(val_rows, None) if val_rows is not None else None
                 for col_idx, val in enumerate(row, start=1):
                     if isinstance(val, str) and val and val[0] == "=":
                         for m in _SHEET_REF.finditer(val):
@@ -214,16 +236,15 @@ def extract_cross_sheet_refs(
                                             link_type="named_range",
                                         )
                                     )
+
+                        # the formula's own computed RESULT can also participate
+                        # in value-matching — this is what catches "a value
+                        # calculated by summing 4 rows on one side, typed in
+                        # directly on the other"
+                        if match_values and val_row is not None and col_idx - 1 < len(val_row):
+                            _index_value(val_row[col_idx - 1], tgt_sheet, f"{get_column_letter(col_idx)}{row_idx}")
                     elif match_values:
-                        result = _numeric_id_key(val)
-                        if result is not None:
-                            key, display, exact = result
-                            digit_count = len(key.lstrip("-"))
-                            if digit_count >= min_value_length:
-                                value_index[key].append(
-                                    (sheet_position[tgt_sheet], tgt_sheet,
-                                     f"{get_column_letter(col_idx)}{row_idx}", display, exact)
-                                )
+                        _index_value(val, tgt_sheet, f"{get_column_letter(col_idx)}{row_idx}")
 
         if match_values:
             for key, occurrences in value_index.items():
@@ -262,6 +283,8 @@ def extract_cross_sheet_refs(
                     )
     finally:
         wb.close()
+        if wb_vals is not None:
+            wb_vals.close()
     return edges
 
 
